@@ -26,9 +26,10 @@ Phases (per the design spec)
 """
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
+from scipy.signal import find_peaks as _find_peaks
 
 
 # ---------------------------------------------------------------------------
@@ -158,3 +159,151 @@ def project_anchor_onto_hce(
     rho[nonzero] = (num[nonzero] / den[nonzero]).astype(np.float32)
 
     return rho, intensity
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — fragment extraction
+# ---------------------------------------------------------------------------
+
+def extract_fragments(
+    mz_axis: np.ndarray,
+    rho: np.ndarray,
+    intensity: np.ndarray,
+    rho_threshold: float = 0.85,
+    min_intensity: float = 0.0,
+    peak_distance_da: float = 0.5,
+) -> List[Dict[str, float]]:
+    """Detect fragment peaks on the anchor-projected HCE intensity profile.
+
+    A peak is accepted only if BOTH:
+      * its projected intensity is a local maximum at least *min_intensity*
+        tall, separated from the nearest kept peak by *peak_distance_da* Da
+      * the maximum Pearson rho within ±*peak_distance_da*/2 around the peak
+        is at least *rho_threshold* (the neighborhood check tolerates 1-2 bin
+        offsets between the intensity and rho maxima)
+
+    Parameters
+    ----------
+    mz_axis : ndarray of float32, shape (n_mz,)
+    rho : ndarray of float32, shape (n_mz,) — from ``project_anchor_onto_hce``
+    intensity : ndarray of float32, shape (n_mz,) — from ``project_anchor_onto_hce``
+    rho_threshold : minimum Pearson rho to accept a peak (default 0.85)
+    min_intensity : minimum projected intensity (default 0)
+    peak_distance_da : minimum m/z separation between kept peaks (Da)
+
+    Returns
+    -------
+    list of dicts with keys ``mz``, ``intensity``, ``rho``, sorted by
+    descending intensity.
+    """
+    mz = np.asarray(mz_axis, dtype=np.float64)
+    rho_a = np.asarray(rho, dtype=np.float64)
+    inten = np.asarray(intensity, dtype=np.float64)
+    if mz.shape != rho_a.shape or mz.shape != inten.shape:
+        raise ValueError("mz_axis, rho, and intensity must have identical shape")
+
+    if inten.max() <= 0:
+        return []
+
+    bin_da = float(np.median(np.diff(mz))) if len(mz) > 1 else peak_distance_da
+    distance_bins = max(1, int(round(peak_distance_da / max(bin_da, 1e-12))))
+
+    peak_idx, _ = _find_peaks(inten, height=min_intensity, distance=distance_bins)
+    if len(peak_idx) == 0:
+        return []
+
+    halfwidth_bins = max(1, distance_bins // 2)
+    fragments: List[Dict[str, float]] = []
+    for k in peak_idx:
+        lo = max(0, int(k) - halfwidth_bins)
+        hi = min(len(mz), int(k) + halfwidth_bins + 1)
+        local_rho = float(rho_a[lo:hi].max())
+        if local_rho < rho_threshold:
+            continue
+        fragments.append(dict(
+            mz=float(mz[k]),
+            intensity=float(inten[k]),
+            rho=local_rho,
+        ))
+
+    fragments.sort(key=lambda f: f["intensity"], reverse=True)
+    return fragments
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — pseudo-MS2 library assembly
+# ---------------------------------------------------------------------------
+
+LIBRARY_SCHEMA: tuple = (
+    "sample",
+    "obs_mz",
+    "charge",
+    "MW",
+    "RT",
+    "im_mono",
+    "ab_cluster_total",
+    "lce_factor_idx",
+    "lce_cluster_idx",
+    "lce_cosine_similarity",
+    "rt_sigma_min",
+    "dt_sigma_bins",
+    "n_fragments",
+    "fragments",
+)
+
+
+def build_library_row(
+    sample: str,
+    anchor: Dict[str, object],
+    precursor: Dict[str, object],
+    fragments: List[Dict[str, float]],
+) -> Dict[str, object]:
+    """Assemble one library row from anchor + precursor + fragment list.
+
+    Parameters
+    ----------
+    sample : source raw-file stem
+    anchor : output of ``extract_anchor``
+    precursor : per-factor record from ``isotope_analysis.process_all_factors``
+                (keys: ``factor_idx``, ``cluster_idx``, ``charge``,
+                ``monoisotopic_mz``, ``monoisotopic_mass_da``,
+                ``cluster_intensity``, ``cosine_similarity``)
+    fragments : list of ``{mz, intensity, rho}`` dicts from ``extract_fragments``
+
+    Returns
+    -------
+    dict whose keys are exactly LIBRARY_SCHEMA
+    """
+    row = dict(
+        sample=str(sample),
+        obs_mz=float(precursor["monoisotopic_mz"]),
+        charge=int(precursor["charge"]),
+        MW=float(precursor["monoisotopic_mass_da"]),
+        RT=float(anchor["rt_center"]),
+        im_mono=float(anchor["dt_center"]),
+        ab_cluster_total=float(precursor["cluster_intensity"]),
+        lce_factor_idx=int(precursor["factor_idx"]),
+        lce_cluster_idx=int(precursor["cluster_idx"]),
+        lce_cosine_similarity=float(precursor["cosine_similarity"]),
+        rt_sigma_min=float(anchor["rt_sigma"]),
+        dt_sigma_bins=float(anchor["dt_sigma"]),
+        n_fragments=int(len(fragments)),
+        fragments=list(fragments),
+    )
+    if set(row.keys()) != set(LIBRARY_SCHEMA):
+        raise RuntimeError(
+            f"build_library_row schema mismatch: {set(row.keys())} vs {set(LIBRARY_SCHEMA)}"
+        )
+    return row
+
+
+def write_library_parquet(rows: List[Dict[str, object]], output_path: str) -> None:
+    """Write library rows to a Parquet file via PyArrow.
+
+    The ``fragments`` column is stored as a list-of-struct so per-fragment
+    ``mz``, ``intensity``, ``rho`` are preserved without row explosion.
+    An empty ``rows`` list produces an empty Parquet with the correct schema.
+    """
+    import pandas as pd
+    df = pd.DataFrame(rows, columns=list(LIBRARY_SCHEMA))
+    df.to_parquet(output_path, engine="pyarrow", index=False)

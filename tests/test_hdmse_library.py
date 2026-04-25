@@ -8,7 +8,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hdmse_library import extract_anchor, project_anchor_onto_hce
+import pandas as pd
+
+from hdmse_library import (
+    LIBRARY_SCHEMA,
+    build_library_row,
+    extract_anchor,
+    extract_fragments,
+    project_anchor_onto_hce,
+    write_library_parquet,
+)
 
 
 def test_extract_anchor_raises_on_zero_vec(axes):
@@ -100,3 +109,109 @@ def test_project_anchor_onto_hce_zero_intensity_bins_have_zero_rho(
     rho, intensity = project_anchor_onto_hce(zero_hce, anchor)
     assert np.all(rho == 0.0)
     assert np.all(intensity == 0.0)
+
+
+def test_extract_fragments_keeps_correlated_rejects_chimera(
+    axes, planted_precursor_anchor, hce_tensor_with_three_fragments,
+):
+    anchor = dict(
+        a_norm=planted_precursor_anchor["a_vec"] /
+               np.linalg.norm(planted_precursor_anchor["a_vec"]),
+        b_norm=planted_precursor_anchor["b_vec"] /
+               np.linalg.norm(planted_precursor_anchor["b_vec"]),
+    )
+    rho, intensity = project_anchor_onto_hce(
+        hce_tensor=hce_tensor_with_three_fragments,
+        anchor=anchor,
+    )
+    fragments = extract_fragments(
+        mz_axis=axes["mz_hce"],
+        rho=rho,
+        intensity=intensity,
+        rho_threshold=0.85,
+        min_intensity=10.0,
+        peak_distance_da=0.5,
+    )
+    mz_kept = sorted(f["mz"] for f in fragments)
+    assert len(fragments) == 2
+    assert mz_kept[0] == pytest.approx(250.000, abs=0.05)
+    assert mz_kept[1] == pytest.approx(600.000, abs=0.05)
+    for f in fragments:
+        assert f["rho"] >= 0.85
+        assert f["intensity"] > 0
+
+
+def test_extract_fragments_returns_empty_when_threshold_above_all(
+    axes, planted_precursor_anchor, hce_tensor_with_three_fragments,
+):
+    anchor = dict(
+        a_norm=planted_precursor_anchor["a_vec"] /
+               np.linalg.norm(planted_precursor_anchor["a_vec"]),
+        b_norm=planted_precursor_anchor["b_vec"] /
+               np.linalg.norm(planted_precursor_anchor["b_vec"]),
+    )
+    rho, intensity = project_anchor_onto_hce(
+        hce_tensor=hce_tensor_with_three_fragments,
+        anchor=anchor,
+    )
+    fragments = extract_fragments(
+        mz_axis=axes["mz_hce"],
+        rho=rho,
+        intensity=intensity,
+        rho_threshold=1.1,   # above the maximum possible Pearson rho
+        min_intensity=10.0,
+        peak_distance_da=0.5,
+    )
+    assert fragments == []
+
+
+def test_library_schema_includes_identification_compatible_columns():
+    cols = set(LIBRARY_SCHEMA)
+    assert {"obs_mz", "charge", "MW", "RT", "im_mono",
+            "ab_cluster_total"}.issubset(cols)
+    assert {"sample", "lce_factor_idx", "rt_sigma_min", "dt_sigma_bins",
+            "n_fragments", "fragments"}.issubset(cols)
+
+
+def test_build_library_row_assembles_precursor_and_fragments(
+    planted_precursor_record, planted_precursor_anchor,
+):
+    fragments = [
+        dict(mz=250.0, intensity=1.0e4, rho=0.99),
+        dict(mz=600.0, intensity=5.0e3, rho=0.97),
+    ]
+    row = build_library_row(
+        sample="260424_AF2501_04_0s",
+        anchor=planted_precursor_anchor,
+        precursor=planted_precursor_record,
+        fragments=fragments,
+    )
+    assert row["obs_mz"] == pytest.approx(812.345)
+    assert row["charge"] == 8
+    assert row["MW"] == pytest.approx(6490.708)
+    assert row["RT"] == pytest.approx(planted_precursor_anchor["rt_center"])
+    assert row["im_mono"] == pytest.approx(planted_precursor_anchor["dt_center"])
+    assert row["ab_cluster_total"] == pytest.approx(1.5e5)
+    assert row["rt_sigma_min"] == pytest.approx(planted_precursor_anchor["rt_sigma"])
+    assert row["dt_sigma_bins"] == pytest.approx(planted_precursor_anchor["dt_sigma"])
+    assert row["n_fragments"] == 2
+    assert row["fragments"] == fragments
+    assert set(row.keys()) == set(LIBRARY_SCHEMA)
+
+
+def test_write_library_parquet_roundtrips_fragments(
+    tmp_path, planted_precursor_record, planted_precursor_anchor,
+):
+    fragments = [dict(mz=250.0, intensity=1.0e4, rho=0.99)]
+    row = build_library_row(
+        sample="x", anchor=planted_precursor_anchor,
+        precursor=planted_precursor_record, fragments=fragments,
+    )
+    out = tmp_path / "library.parquet"
+    write_library_parquet([row], str(out))
+    loaded = pd.read_parquet(out)
+    assert len(loaded) == 1
+    loaded_frags = list(loaded.iloc[0]["fragments"])
+    assert len(loaded_frags) == 1
+    assert float(loaded_frags[0]["mz"]) == pytest.approx(250.0)
+    assert float(loaded_frags[0]["rho"]) == pytest.approx(0.99)
