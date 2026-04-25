@@ -89,3 +89,72 @@ def extract_anchor(
         dt_center=dt_center, dt_sigma=dt_sigma,
         a_norm=a_norm, b_norm=b_norm,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — projection and correlation
+# ---------------------------------------------------------------------------
+
+def project_anchor_onto_hce(
+    hce_tensor: np.ndarray,
+    anchor: Dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project an LCE anchor onto an HCE tensor — vectorised over m/z.
+
+    For an anchor with L2-normalized RT vector ``a`` (shape n_rt) and DT
+    vector ``b`` (shape n_dt) and an HCE tensor ``H`` of shape
+    ``(n_rt, n_dt, n_mz)``, returns two length-``n_mz`` arrays:
+
+        rho[k]       = Pearson(vec(H[:,:,k]), vec(a ⊗ b))
+        intensity[k] = sum_{i,j} H[i,j,k] * a[i] * b[j]
+
+    Implementation uses a single ``(n_rt*n_dt, n_mz)`` reshape and one
+    matrix multiplication for intensity, plus three reductions for the
+    Pearson numerator/denominator. Pearson is defined as 0 (not NaN) for
+    bins whose RT×DT slice is constant (e.g. all-zero).
+
+    Parameters
+    ----------
+    hce_tensor : ndarray of float32, shape (n_rt, n_dt, n_mz)
+    anchor : dict with ``a_norm`` (n_rt,) and ``b_norm`` (n_dt,) —
+             L2-normalized; ``extract_anchor`` already normalizes.
+
+    Returns
+    -------
+    rho : ndarray of float32, shape (n_mz,) — Pearson correlation per m/z bin
+    intensity : ndarray of float32, shape (n_mz,) — projected intensity per m/z bin
+    """
+    H = np.asarray(hce_tensor, dtype=np.float32)
+    a = np.asarray(anchor["a_norm"], dtype=np.float32)
+    b = np.asarray(anchor["b_norm"], dtype=np.float32)
+
+    n_rt, n_dt, n_mz = H.shape
+    if a.shape[0] != n_rt or b.shape[0] != n_dt:
+        raise ValueError(
+            f"Anchor shape ({a.shape}, {b.shape}) does not match "
+            f"HCE tensor RT/DT dims ({n_rt}, {n_dt})."
+        )
+
+    anchor_flat = np.outer(a, b).reshape(-1).astype(np.float32)  # (N,)
+    H_flat = H.reshape(n_rt * n_dt, n_mz)                        # (N, n_mz)
+    n = float(anchor_flat.size)
+
+    intensity = (anchor_flat @ H_flat).astype(np.float32)        # (n_mz,)
+
+    # Pearson: rho = (n·Σxy − Σx·Σy) / sqrt((n·Σx² − (Σx)²)·(n·Σy² − (Σy)²))
+    sum_a = float(anchor_flat.sum())
+    sum_a2 = float((anchor_flat * anchor_flat).sum())
+    sum_h = H_flat.sum(axis=0)              # (n_mz,)
+    sum_h2 = (H_flat * H_flat).sum(axis=0)  # (n_mz,)
+    sum_ah = anchor_flat @ H_flat           # (n_mz,)
+
+    num = n * sum_ah - sum_a * sum_h
+    den_a = n * sum_a2 - sum_a * sum_a
+    den_h = n * sum_h2 - sum_h * sum_h
+    den = np.sqrt(np.maximum(den_a * den_h, 0.0))
+
+    rho = np.zeros(n_mz, dtype=np.float32)
+    nonzero = den > 0
+    rho[nonzero] = (num[nonzero] / den[nonzero]).astype(np.float32)
+
+    return rho, intensity

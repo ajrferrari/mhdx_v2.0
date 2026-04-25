@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hdmse_library import extract_anchor
+from hdmse_library import extract_anchor, project_anchor_onto_hce
 
 
 def test_extract_anchor_raises_on_zero_vec(axes):
@@ -54,3 +54,49 @@ def test_extract_anchor_recovers_planted_centroids(axes, planted_precursor_ancho
     # Anchor vectors are L2-normalized so projection magnitudes are comparable
     assert np.linalg.norm(anchor["a_norm"]) == pytest.approx(1.0, abs=1e-5)
     assert np.linalg.norm(anchor["b_norm"]) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_project_anchor_onto_hce_high_rho_at_planted_fragments(
+    axes, planted_precursor_anchor, hce_tensor_with_three_fragments,
+):
+    anchor = dict(
+        a_norm=planted_precursor_anchor["a_vec"] /
+               np.linalg.norm(planted_precursor_anchor["a_vec"]),
+        b_norm=planted_precursor_anchor["b_vec"] /
+               np.linalg.norm(planted_precursor_anchor["b_vec"]),
+    )
+    rho, intensity = project_anchor_onto_hce(
+        hce_tensor=hce_tensor_with_three_fragments,
+        anchor=anchor,
+    )
+    mz_hce = axes["mz_hce"]
+    assert rho.shape == (len(mz_hce),)
+    assert intensity.shape == (len(mz_hce),)
+
+    def _rho_near(mz_target: float, halfwidth_da: float = 0.2) -> float:
+        mask = np.abs(mz_hce - mz_target) <= halfwidth_da
+        return float(rho[mask].max())
+
+    # Co-eluting fragments → rho close to 1
+    assert _rho_near(250.000) > 0.95
+    assert _rho_near(600.000) > 0.95
+    # RT-shifted chimera → rho falls well below the 0.85 threshold
+    assert _rho_near(900.000) < 0.80
+
+
+def test_project_anchor_onto_hce_zero_intensity_bins_have_zero_rho(
+    axes, planted_precursor_anchor,
+):
+    """For all-zero HCE bins rho must be 0 (not NaN), so downstream peak
+    finding is well-behaved."""
+    anchor = dict(
+        a_norm=planted_precursor_anchor["a_vec"] /
+               np.linalg.norm(planted_precursor_anchor["a_vec"]),
+        b_norm=planted_precursor_anchor["b_vec"] /
+               np.linalg.norm(planted_precursor_anchor["b_vec"]),
+    )
+    n_rt, n_dt, n_mz = len(axes["rt"]), len(axes["dt"]), 100
+    zero_hce = np.zeros((n_rt, n_dt, n_mz), dtype=np.float32)
+    rho, intensity = project_anchor_onto_hce(zero_hce, anchor)
+    assert np.all(rho == 0.0)
+    assert np.all(intensity == 0.0)
