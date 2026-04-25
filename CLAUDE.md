@@ -48,6 +48,30 @@ snakemake -s src/Snakefile_identify \
 
 Create log dir: `mkdir -p results/id/logs/slurm`
 
+### HDMS^E anchor-and-project pseudo-MS2 library
+
+Builds a fragment library from interleaved LCE (Function 0, precursors) and
+HCE (Function 1, post-mobility fragments) acquisitions. Reuses the existing
+LCE NTF decomposition as immutable RT/IM anchors, then projects each anchor
+onto the HCE tensor and keeps fragments whose Pearson correlation with the
+anchor's rank-1 RT×DT shape is above `rho_threshold` (default 0.85).
+
+```bash
+# Inside the Singularity container:
+python src/hdmse_pipeline.py process_raw \
+  data/260424_AF2501_04_0s.raw \
+  ../software/MassLynxSDKDownload_v5.0.0/license.key \
+  --output results/hdmse/260424_AF2501_04_0s_library.parquet \
+  --lce_mz_window 50.0 --hce_mz_slab 100.0 \
+  --rho_threshold 0.85 --verbose
+```
+
+Configuration lives in `src/config.yaml` under the top-level `hdmse:` block.
+The output Parquet schema (`hdmse_library.LIBRARY_SCHEMA`) is designed to
+feed `protein_identification.identify()` directly via the `obs_mz`,
+`charge`, `MW`, `RT`, `im_mono`, `ab_cluster_total` columns; per-precursor
+fragment lists are kept nested in the `fragments` column.
+
 ### Running individual pipeline steps manually (inside the container)
 
 ```bash
@@ -117,6 +141,8 @@ batch_NNNN.csv   ← one per batch; individual slice errors are caught, batch al
 | File | Role |
 |------|------|
 | `pipeline.py` | Orchestrates one slice: BPI/TIC check → tensor → NTF → isotope analysis → CSV. Also contains CLI entry points for all Snakemake shell directives. |
+| `hdmse_library.py` | Pure-NumPy anchor-and-project core: `extract_anchor`, `project_anchor_onto_hce`, `extract_fragments`, library schema and Parquet writer. SDK-free → unit-tested on ARM. |
+| `hdmse_pipeline.py` | SDK-facing orchestrator: iterates LCE m/z windows, calls `analyze_chunk` + `process_all_factors`, projects anchors onto HCE m/z slabs, writes the library Parquet. Container-only. |
 | `tensor_analysis.py` | Builds 3D (RT × DT × m/z) tensors; runs NTF (PARAFAC) with automatic rank selection via pairwise correlation; Gaussian quality filters on RT/DT modes. |
 | `isotope_analysis.py` | Per-factor isotope envelope detection: peak finding, charge-state assignment, averagine cosine scoring, monoisotopic mass inference. |
 | `waters_reader.py` | Wraps Waters MassLynx SDK v5.0.0; provides `WatersRawReader` context manager for accessing RT×DT×m/z data cubes, TIC, and metadata. |
