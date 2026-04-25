@@ -22,6 +22,7 @@ Both functions mutate no global state and write only the file specified in
 from __future__ import annotations
 
 import os
+import traceback
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -187,6 +188,15 @@ def process_lce_window(
             )
             fragments_by_factor[factor_idx].extend(slab_fragments)
 
+    for factor_idx, fragments in fragments_by_factor.items():
+        best_by_fragment = {}
+        for fragment in fragments:
+            key = round(float(fragment["mz"]), 3)
+            current = best_by_fragment.get(key)
+            if current is None or float(fragment["intensity"]) > float(current["intensity"]):
+                best_by_fragment[key] = fragment
+        fragments_by_factor[factor_idx] = list(best_by_fragment.values())
+
     rows: List[Dict[str, object]] = []
     for _, prec in precursors_df.iterrows():
         factor_idx = int(prec["factor_idx"])
@@ -249,11 +259,12 @@ def process_raw_file(
     all_rows: List[Dict[str, object]] = []
     with WatersRawReader(raw_path, license=license_key) as reader:
         meta = reader.metadata()
-        if hce_function >= meta.n_functions:
-            raise ValueError(
-                f"hce_function={hce_function} not present "
-                f"(file has {meta.n_functions} functions)"
-            )
+        n_fn = meta.n_functions
+        for name, idx in (("lce_function", lce_function), ("hce_function", hce_function)):
+            if not 0 <= idx < n_fn:
+                raise ValueError(
+                    f"{name}={idx} not present (file has {n_fn} functions)"
+                )
         if meta.n_scans[lce_function] != meta.n_scans[hce_function]:
             raise ValueError(
                 f"LCE/HCE scan counts differ "
@@ -263,6 +274,7 @@ def process_raw_file(
 
         lce_mz_min, lce_mz_max = meta.mass_range[lce_function]
         starts = np.arange(lce_mz_min, lce_mz_max, lce_mz_step, dtype=np.float64)
+        failed_windows: List[str] = []
         for s in starts:
             lo = float(s)
             hi = float(min(s + lce_mz_window, lce_mz_max))
@@ -291,12 +303,15 @@ def process_raw_file(
                 )
                 all_rows.extend(rows)
             except Exception as exc:
-                import traceback
                 print(f"[hdmse] WARNING: window m/z={lo:.1f}-{hi:.1f} failed: {exc}")
+                failed_windows.append(f"{lo:.1f}-{hi:.1f}: {exc}")
                 traceback.print_exc()
 
     write_library_parquet(all_rows, output_path)
     print(f"[hdmse] wrote {len(all_rows)} library rows → {output_path}")
+    if failed_windows:
+        failures = "; ".join(failed_windows)
+        raise RuntimeError(f"One or more LCE windows failed: {failures}")
 
 
 # ---------------------------------------------------------------------------
