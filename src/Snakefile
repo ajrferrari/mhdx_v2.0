@@ -1,0 +1,439 @@
+# =============================================================================
+# Snakefile — HDX-MS isotope analysis distributed pipeline
+# =============================================================================
+#
+# Launch on a SLURM cluster:
+#
+#   snakemake -s Snakefile \
+#     --configfile config.yaml \
+#     -j 1000 --keep-going \
+#     --use-singularity \
+#     --singularity-args "--bind /projects/b1107,/scratch/ajf4103" \
+#     --cluster "sbatch -A p31346 -p short -N 1 -n {resources.cpus} \
+#                --mem={resources.mem_mb}M -t {resources.runtime} \
+#                --output results/logs/slurm/slurm-%j.out \
+#                --error  results/logs/slurm/slurm-%j.err" \
+#     --max-jobs-per-second 3 \
+#     --latency-wait 60 \
+#     --rerun-incomplete
+#
+# Note: results/logs/slurm/ is auto-deleted on successful pipeline completion
+# (see onsuccess block at the bottom).  If a job dies before Python starts
+# (e.g. module/singularity errors), the SLURM .out file is the only record —
+# inspect it before re-running.  Create the directory before first launch:
+#   mkdir -p results/logs/slurm
+#
+# DAG design
+# ----------
+# Three stages per sample:
+#
+#   1. write_slice_list (checkpoint, 1 job)
+#      Reads TIC chromatogram once, applies BPI/TIC filters, writes:
+#        - slice_list.json        productive slices only (wildcard source)
+#        - {sample}_slice_metrics.csv  all slices with pass/fail annotation
+#
+#   2. process_batch  (ceil(N_slices / batch_size) jobs)
+#      Each job processes batch_size slices sequentially, writing one combined
+#      CSV.  Individual slice errors are caught internally; the batch always
+#      writes its output so aggregate is never blocked.
+#
+#   3. aggregate  (1 job)
+#      Depends on all batch CSVs (checkpoint-derived via _batch_ids).
+#      Snakemake waits for ALL process_batch jobs, then the Python glob
+#      collects whatever CSVs exist.
+#
+# Performance notes
+# -----------------
+# DAG has ceil(N_slices / batch_size) nodes instead of N_slices.
+# For 20 000 slices and batch_size=50: 400 nodes, dry-run in seconds,
+# SLURM submission at 3/s takes ~2 min instead of ~1.8 h.
+# =============================================================================
+
+import json
+import math
+import os
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+configfile: "config.yaml"
+
+singularity: os.path.expanduser(config["singularity_image"])
+
+SAMPLES  = {Path(p).stem: p for p in config["samples"]}
+FUNCTION = config.get("function", 0)
+PYTHON   = config.get("python_exec", "python3")
+PIPELINE     = os.path.join(workflow.basedir, "pipeline.py")
+CALIBRATION  = os.path.join(workflow.basedir, "calibration.py")
+
+SCRATCH  = config["scratch_dir"]
+OUTDIR   = config["output_dir"]
+PLOTSDIR = config["plots_dir"]
+
+SLICE_CFG   = config["slice"]
+THRESH      = config["thresholds"]
+PRE_FILTER  = config.get("pre_filter", {})
+NTF        = config["ntf"]
+LICENSE    = config["license_path"]
+BATCH_SIZE    = config.get("batch_size", 50)
+_PLOTS_CFG    = config.get("plots", {})
+PNG_DPI       = _PLOTS_CFG.get("png_dpi", 100)
+PLOT_FORMAT   = _PLOTS_CFG.get("plot_format", "png")
+SAVE_CLUSTERS = _PLOTS_CFG.get("save_clusters", True)
+SAVE_FACTORS  = _PLOTS_CFG.get("save_factors", False)
+CAL_CFG       = config.get("calibration", {})
+SLURM_LOGS    = config.get("slurm_logs_dir", "results/logs/slurm")
+_FILT_CFG     = config.get("filters", {})
+FILT_BPI_MIN           = _FILT_CFG.get("cluster_bpi_min",           5e3)
+FILT_TIC_BPI_RATIO_MIN = _FILT_CFG.get("cluster_tic_bpi_ratio_min", 10.0)
+FILT_RT_R2_MIN         = _FILT_CFG.get("rt_gaussian_r2_min",        0.9)
+FILT_DT_R2_MIN         = _FILT_CFG.get("dt_gaussian_r2_min",        0.9)
+FILT_RT_EDGE           = _FILT_CFG.get("rt_edge_margin",            0.1)
+FILT_DT_EDGE           = _FILT_CFG.get("dt_edge_margin",            5.0)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helper — load productive slice list (used only by _slice_ids)
+# ---------------------------------------------------------------------------
+
+_SLICE_CACHE: dict = {}
+
+def _load_slices(sample):
+    """Read and cache the productive slice list for one sample."""
+    if sample not in _SLICE_CACHE:
+        json_path = checkpoints.write_slice_list.get(sample=sample).output.json
+        with open(json_path) as fh:
+            _SLICE_CACHE[sample] = json.load(fh)
+    return _SLICE_CACHE[sample]
+
+
+def _batch_ids(wildcards):
+    """Expand per-batch CSV paths — called once for the aggregate input.
+
+    Returns ceil(N_slices / BATCH_SIZE) paths instead of N_slices, which
+    keeps the DAG small enough for fast dry-run and low SLURM submission cost.
+    """
+    slices    = _load_slices(wildcards.sample)
+    n_batches = math.ceil(len(slices) / BATCH_SIZE)
+    return expand(
+        os.path.join(SCRATCH, "{sample}", "batch_{batch_id}.csv"),
+        sample=wildcards.sample,
+        batch_id=[f"{i:04d}" for i in range(n_batches)],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wildcard constraints
+# ---------------------------------------------------------------------------
+
+wildcard_constraints:
+    sample   = r"[^/]+",
+    batch_id = r"\d{4}",
+
+
+# ---------------------------------------------------------------------------
+# Top-level target
+# ---------------------------------------------------------------------------
+
+rule all:
+    input:
+        expand(
+            os.path.join(OUTDIR, "{sample}_isotopes_cal.csv"),
+            sample=SAMPLES.keys(),
+        ),
+        expand(
+            os.path.join(OUTDIR, "{sample}_isotopes_filtered.csv"),
+            sample=SAMPLES.keys(),
+        ),
+        expand(
+            os.path.join(OUTDIR, "{sample}_slice_metrics.csv"),
+            sample=SAMPLES.keys(),
+        ),
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint: write_slice_list (1 job per sample)
+# ---------------------------------------------------------------------------
+
+checkpoint write_slice_list:
+    input:
+        raw = lambda wc: SAMPLES[wc.sample],
+    output:
+        json    = os.path.join(SCRATCH, "{sample}", "slice_list.json"),
+        metrics = os.path.join(OUTDIR,  "{sample}_slice_metrics.csv"),
+    params:
+        python        = PYTHON,
+        pipeline      = PIPELINE,
+        license       = LICENSE,
+        function      = FUNCTION,
+        dt_width      = SLICE_CFG["dt_width"],
+        dt_step       = SLICE_CFG["dt_step"],
+        rt_width      = SLICE_CFG["rt_width"],
+        rt_step       = SLICE_CFG["rt_step"],
+        mz_width      = SLICE_CFG["mz_width"],
+        mz_step       = SLICE_CFG["mz_step"],
+        tic_threshold = PRE_FILTER.get("tic_min", 0),
+        bpi_threshold = PRE_FILTER.get("bpi_min", 0),
+    resources:
+        mem_mb  = config["resources"]["scan_metrics"]["mem_mb"],
+        runtime = config["resources"]["scan_metrics"]["runtime"],
+        cpus    = config["resources"]["scan_metrics"]["cpus"],
+    log:
+        os.path.join(SCRATCH, "{sample}", "logs", "write_slice_list.log"),
+    benchmark:
+        os.path.join(SCRATCH, "{sample}", "benchmarks", "write_slice_list.tsv"),
+    shell:
+        """
+        {params.python} {params.pipeline} write_slice_list \
+            {input.raw} \
+            {params.license} \
+            --function      {params.function} \
+            --output_json   {output.json} \
+            --metrics_csv   {output.metrics} \
+            --dt_width      {params.dt_width} \
+            --dt_step       {params.dt_step} \
+            --rt_width      {params.rt_width} \
+            --rt_step       {params.rt_step} \
+            --mz_width      {params.mz_width} \
+            --mz_step       {params.mz_step} \
+            --tic_threshold {params.tic_threshold} \
+            --bpi_threshold {params.bpi_threshold} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Rule: process_batch (1 job per batch of slices)
+# ---------------------------------------------------------------------------
+# Each job reads its assigned slice range from slice_list.json and processes
+# them sequentially, writing one combined CSV.  DAG size is
+# ceil(N_slices / batch_size) instead of N_slices — dramatically faster
+# dry-runs and much cheaper SLURM submission.
+# Memory stays the same as a single-slice job (slices run sequentially).
+
+rule process_batch:
+    input:
+        raw        = lambda wc: SAMPLES[wc.sample],
+        slice_list = os.path.join(SCRATCH, "{sample}", "slice_list.json"),
+    output:
+        csv = os.path.join(SCRATCH, "{sample}", "batch_{batch_id}.csv"),
+    params:
+        python     = PYTHON,
+        pipeline   = PIPELINE,
+        license    = LICENSE,
+        function   = FUNCTION,
+        plots_dir          = lambda wc: os.path.join(PLOTSDIR, wc.sample),
+        bpi_min            = THRESH["bpi_min"],
+        tic_min            = THRESH["tic_min"],
+        rank_init          = NTF["rank_init"],
+        rank_max           = NTF["rank_max"],
+        n_restarts         = NTF["n_restarts"],
+        batch_size         = BATCH_SIZE,
+        png_dpi            = PNG_DPI,
+        plot_format        = PLOT_FORMAT,
+        save_factors_flag  = "--save_factors"    if SAVE_FACTORS  else "",
+        no_clusters_flag   = "--no_save_clusters" if not SAVE_CLUSTERS else "",
+    resources:
+        mem_mb  = config["resources"]["process_batch"]["mem_mb"],
+        runtime = config["resources"]["process_batch"]["runtime"],
+        cpus    = config["resources"]["process_batch"]["cpus"],
+    log:
+        os.path.join(SCRATCH, "{sample}", "logs", "batch_{batch_id}.log"),
+    benchmark:
+        os.path.join(SCRATCH, "{sample}", "benchmarks", "batch_{batch_id}.tsv"),
+    shell:
+        """
+        {params.python} {params.pipeline} process_batch \
+            {input.raw} \
+            {params.license} \
+            --function      {params.function} \
+            --slice_list    {input.slice_list} \
+            --batch_idx     {wildcards.batch_id} \
+            --batch_size    {params.batch_size} \
+            --output_dir    {params.plots_dir} \
+            --output_csv    {output.csv} \
+            --bpi_threshold {params.bpi_min} \
+            --tic_threshold {params.tic_min} \
+            --rank_init     {params.rank_init} \
+            --rank_max      {params.rank_max} \
+            --n_restarts    {params.n_restarts} \
+            --png_dpi       {params.png_dpi} \
+            --plot_format   {params.plot_format} \
+            {params.save_factors_flag} \
+            {params.no_clusters_flag} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Rule: aggregate (1 job per sample)
+# ---------------------------------------------------------------------------
+# Depends on _batch_ids (checkpoint-derived) — Snakemake waits for ALL
+# process_batch jobs before submitting.  The Python glob then collects
+# whatever batch CSVs actually exist.
+
+rule aggregate:
+    input:
+        _batch_ids,
+    output:
+        csv = os.path.join(OUTDIR, "{sample}_isotopes.csv"),
+    params:
+        python   = PYTHON,
+        pipeline = PIPELINE,
+        pattern  = lambda wc: os.path.join(SCRATCH, wc.sample, "*.csv"),
+    resources:
+        mem_mb  = config["resources"]["aggregate"]["mem_mb"],
+        runtime = config["resources"]["aggregate"]["runtime"],
+        cpus    = config["resources"]["aggregate"]["cpus"],
+    log:
+        os.path.join(OUTDIR, "logs", "{sample}_aggregate.log"),
+    benchmark:
+        os.path.join(OUTDIR, "benchmarks", "{sample}_aggregate.tsv"),
+    shell:
+        """
+        {params.python} {params.pipeline} aggregate \
+            --input_pattern '{params.pattern}' \
+            --output_csv {output.csv} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Rule: calibrate_lockmass (1 job per sample)
+# ---------------------------------------------------------------------------
+# Reads the last function of the .raw file (lock-mass), fits Gaussian peaks
+# to the Sodium Formate reference masses, and builds one polynomial
+# calibration curve per RT chunk.  Runs independently of process_batch and
+# can be submitted in parallel with the slice processing stage.
+
+rule calibrate_lockmass:
+    input:
+        raw = lambda wc: SAMPLES[wc.sample],
+    output:
+        json = os.path.join(OUTDIR, "{sample}_calibration.json"),
+        pdf  = os.path.join(OUTDIR, "{sample}_calibration.pdf"),
+    params:
+        python        = PYTHON,
+        calibration   = CALIBRATION,
+        license       = LICENSE,
+        compound      = CAL_CFG.get("compound",      "SodiumFormate"),
+        n_chunks      = CAL_CFG.get("n_chunks",      6),
+        polyfit_deg   = CAL_CFG.get("polyfit_deg",   1),
+        ppm_radius    = CAL_CFG.get("ppm_radius",    100.0),
+        min_intensity = CAL_CFG.get("min_intensity", 1000.0),
+        mz_min        = CAL_CFG.get("mz_min",        50.0),
+        mz_max        = CAL_CFG.get("mz_max",        2200.0),
+    resources:
+        mem_mb  = config["resources"]["calibrate_lockmass"]["mem_mb"],
+        runtime = config["resources"]["calibrate_lockmass"]["runtime"],
+        cpus    = config["resources"]["calibrate_lockmass"]["cpus"],
+    log:
+        os.path.join(OUTDIR, "logs", "{sample}_calibrate.log"),
+    benchmark:
+        os.path.join(OUTDIR, "benchmarks", "{sample}_calibrate.tsv"),
+    shell:
+        """
+        {params.python} {params.calibration} extract \
+            {input.raw} \
+            {params.license} \
+            --compound      {params.compound} \
+            --n_chunks      {params.n_chunks} \
+            --polyfit_deg   {params.polyfit_deg} \
+            --ppm_radius    {params.ppm_radius} \
+            --min_intensity {params.min_intensity} \
+            --mz_min        {params.mz_min} \
+            --mz_max        {params.mz_max} \
+            --output_json   {output.json} \
+            --output_pdf    {output.pdf} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Rule: apply_calibration (1 job per sample)
+# ---------------------------------------------------------------------------
+# Post-processing: applies per-RT-chunk polynomial calibration to the
+# monoisotopic_mz column of the aggregate CSV.  Depends on both aggregate
+# and calibrate_lockmass so it runs only after both are complete.
+
+rule apply_calibration:
+    input:
+        isotopes = os.path.join(OUTDIR, "{sample}_isotopes.csv"),
+        cal_json = os.path.join(OUTDIR, "{sample}_calibration.json"),
+    output:
+        csv = os.path.join(OUTDIR, "{sample}_isotopes_cal.csv"),
+    params:
+        python      = PYTHON,
+        calibration = CALIBRATION,
+    resources:
+        mem_mb  = config["resources"]["apply_calibration"]["mem_mb"],
+        runtime = config["resources"]["apply_calibration"]["runtime"],
+        cpus    = config["resources"]["apply_calibration"]["cpus"],
+    log:
+        os.path.join(OUTDIR, "logs", "{sample}_apply_calibration.log"),
+    benchmark:
+        os.path.join(OUTDIR, "benchmarks", "{sample}_apply_calibration.tsv"),
+    shell:
+        """
+        {params.python} {params.calibration} apply_csv \
+            --input_csv  {input.isotopes} \
+            --cal_json   {input.cal_json} \
+            --output_csv {output.csv} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Rule: apply_filters (1 job per sample)
+# ---------------------------------------------------------------------------
+# Post-processing: applies quality filters to the calibrated aggregate CSV
+# and writes *_isotopes_filtered.csv.  Depends only on apply_calibration.
+
+rule apply_filters:
+    input:
+        isotopes_cal = os.path.join(OUTDIR, "{sample}_isotopes_cal.csv"),
+    output:
+        csv = os.path.join(OUTDIR, "{sample}_isotopes_filtered.csv"),
+    params:
+        python                 = PYTHON,
+        pipeline               = PIPELINE,
+        cluster_bpi_min        = FILT_BPI_MIN,
+        cluster_tic_bpi_ratio  = FILT_TIC_BPI_RATIO_MIN,
+        rt_gaussian_r2_min     = FILT_RT_R2_MIN,
+        dt_gaussian_r2_min     = FILT_DT_R2_MIN,
+        rt_edge_margin         = FILT_RT_EDGE,
+        dt_edge_margin         = FILT_DT_EDGE,
+    resources:
+        mem_mb  = config["resources"]["apply_calibration"]["mem_mb"],
+        runtime = config["resources"]["apply_calibration"]["runtime"],
+        cpus    = config["resources"]["apply_calibration"]["cpus"],
+    log:
+        os.path.join(OUTDIR, "logs", "{sample}_apply_filters.log"),
+    benchmark:
+        os.path.join(OUTDIR, "benchmarks", "{sample}_apply_filters.tsv"),
+    shell:
+        """
+        {params.python} {params.pipeline} apply_filters \
+            --input_csv                  {input.isotopes_cal} \
+            --output_csv                 {output.csv} \
+            --cluster_bpi_min            {params.cluster_bpi_min} \
+            --cluster_tic_bpi_ratio_min  {params.cluster_tic_bpi_ratio} \
+            --rt_gaussian_r2_min         {params.rt_gaussian_r2_min} \
+            --dt_gaussian_r2_min         {params.dt_gaussian_r2_min} \
+            --rt_edge_margin             {params.rt_edge_margin} \
+            --dt_edge_margin             {params.dt_edge_margin} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks
+# ---------------------------------------------------------------------------
+
+onsuccess:
+    import shutil
+    if os.path.isdir(SLURM_LOGS):
+        shutil.rmtree(SLURM_LOGS)
+        print(f"[onsuccess] Deleted SLURM log directory: {SLURM_LOGS}")

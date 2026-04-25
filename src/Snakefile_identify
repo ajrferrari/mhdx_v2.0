@@ -1,0 +1,218 @@
+# =============================================================================
+# Snakefile_identify — HDX-MS protein identification workflow
+# =============================================================================
+#
+# Performs two-stage protein identification (50 ppm → polyfit → 10 ppm) with
+# decoy generation and FDR estimation for every combination of
+# (isotope run × protein database).
+#
+# Launch on a SLURM cluster:
+#
+#   snakemake -s Snakefile_identify \
+#     --configfile config_identify.yaml \
+#     -j 500 --keep-going \
+#     --use-singularity \
+#     --singularity-args "--bind /projects/b1107,/scratch/ajf4103" \
+#     --cluster "sbatch -A p31346 -p short -N 1 -n {resources.cpus} \
+#                --mem={resources.mem_mb}M -t {resources.runtime} \
+#                --output results/id/logs/slurm-%j.out \
+#                --error  results/id/logs/slurm-%j.err" \
+#     --max-jobs-per-second 3 \
+#     --latency-wait 60 \
+#     --rerun-incomplete
+#
+# DAG design
+# ----------
+# Stage A — generate_decoys (1 job per database file)
+#   Reads the protein CSV/FASTA and generates the target+decoy database.
+#   Output is cached so that all runs sharing the same database re-use it.
+#
+# Stage B — identify (1 job per run × database pair)
+#   Runs the full two-stage identification pipeline and writes
+#   {outdir}/{run}/{db_stem}_identifications.csv
+#   and (optionally) {outdir}/{run}/{db_stem}_diagnostics.pdf
+#
+# Configuration
+# -------------
+# All settings are read from config_identify.yaml (see below for format).
+# =============================================================================
+
+import os
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+configfile: "config_identify.yaml"
+
+singularity: os.path.expanduser(config["singularity_image"])
+
+PYTHON    = config.get("python_exec", "python3")
+IDENTIFY  = os.path.join(workflow.basedir, "protein_identification.py")
+
+# Isotope files: list of paths to *_isotopes_filtered.csv (or *_isotopes_cal.csv)
+# The run name is the file stem (everything before the first underscore or the
+# full stem if no underscores).
+ISOTOPE_FILES = config["isotope_files"]
+
+# Database files: list of paths to protein CSV files (name, sequence[, MW])
+DATABASE_FILES = config["database_files"]
+
+# Build lookup dicts: stem → path
+RUNS = {Path(p).stem: p for p in ISOTOPE_FILES}
+DBS  = {Path(p).stem: p for p in DATABASE_FILES}
+
+OUTDIR    = config.get("output_dir", "results/id")
+DECOYDIR  = config.get("decoy_dir",  "results/id/decoys")
+
+_ID_CFG   = config.get("identification", {})
+PPM1      = _ID_CFG.get("ppm_stage1",  50.0)
+PPM2      = _ID_CFG.get("ppm_stage2",  10.0)
+POLYDEG   = _ID_CFG.get("polyfit_deg",  2)
+DECOY_N   = _ID_CFG.get("decoy_size",   2)
+PPM_DECOY = _ID_CFG.get("ppm_tol_decoy", 50.0)
+SAVE_PDF  = _ID_CFG.get("save_diagnostics_pdf", True)
+IDOTP_MIN     = _ID_CFG.get("idotp_min",              0.0)
+CALIB_TIC_BPI = _ID_CFG.get("calib_min_tic_bpi_ratio", 10.0)
+CALIB_COS_SIM = _ID_CFG.get("calib_min_cosine_sim",    0.98)
+CALIB_RT_R2   = _ID_CFG.get("calib_min_rt_r2",         0.9)
+CALIB_DT_R2   = _ID_CFG.get("calib_min_dt_r2",         0.9)
+SLURM_LOGS = config.get("slurm_logs_dir", "results/id/logs/slurm")
+
+# ---------------------------------------------------------------------------
+# Wildcard constraints
+# ---------------------------------------------------------------------------
+
+wildcard_constraints:
+    run = r"[^/]+",
+    db  = r"[^/]+",
+
+# ---------------------------------------------------------------------------
+# Top-level target
+# ---------------------------------------------------------------------------
+
+rule all:
+    input:
+        # Identification tables
+        expand(
+            os.path.join(OUTDIR, "{run}", "{db}_identifications.csv"),
+            run=RUNS.keys(),
+            db=DBS.keys(),
+        ),
+        # Diagnostic PDFs (if enabled)
+        (expand(
+            os.path.join(OUTDIR, "{run}", "{db}_diagnostics.pdf"),
+            run=RUNS.keys(),
+            db=DBS.keys(),
+        ) if SAVE_PDF else []),
+
+
+# ---------------------------------------------------------------------------
+# Rule: generate_decoys (1 job per database)
+# ---------------------------------------------------------------------------
+# Runs once per database regardless of how many isotope runs are processed.
+# The combined target+decoy CSV is written to DECOYDIR and re-used by all
+# identify jobs that share the same database.
+
+rule generate_decoys:
+    input:
+        database = lambda wc: DBS[wc.db],
+    output:
+        combined = os.path.join(DECOYDIR, "{db}_with_decoys.csv"),
+    params:
+        python     = PYTHON,
+        identify   = IDENTIFY,
+        decoy_size = DECOY_N,
+        ppm_tol    = PPM_DECOY,
+    resources:
+        mem_mb  = config["resources"]["generate_decoys"]["mem_mb"],
+        runtime = config["resources"]["generate_decoys"]["runtime"],
+        cpus    = config["resources"]["generate_decoys"]["cpus"],
+    log:
+        os.path.join(DECOYDIR, "logs", "{db}_generate_decoys.log"),
+    benchmark:
+        os.path.join(DECOYDIR, "benchmarks", "{db}_generate_decoys.tsv"),
+    shell:
+        """
+        {params.python} {params.identify} generate_decoys \
+            --database   {input.database} \
+            --output     {output.combined} \
+            --decoy_size {params.decoy_size} \
+            --ppm_tol    {params.ppm_tol} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Rule: identify (1 job per run × database pair)
+# ---------------------------------------------------------------------------
+# Runs the two-stage identification pipeline.  The decoy-augmented database
+# is produced by generate_decoys and shared across all runs.
+#
+# Note: protein_identification.py's --database argument accepts the
+# target+decoy CSV directly (skipping internal decoy generation) when passed
+# the pre-built file from generate_decoys.  The identify subcommand always
+# calls generate_decoys internally — so to use the pre-built file we pass it
+# as --database and set --decoy_size 0 to skip re-generation.
+# Actually, since generate_decoys already built the combined CSV, we pass it
+# directly as the database and set decoy_size=0.
+
+rule identify:
+    input:
+        isotopes = lambda wc: RUNS[wc.run],
+        database = os.path.join(DECOYDIR, "{db}_with_decoys.csv"),
+    output:
+        csv = os.path.join(OUTDIR, "{run}", "{db}_identifications.csv"),
+        pdf = os.path.join(OUTDIR, "{run}", "{db}_diagnostics.pdf") if SAVE_PDF else [],
+    params:
+        python      = PYTHON,
+        identify    = IDENTIFY,
+        ppm_stage1  = PPM1,
+        ppm_stage2  = PPM2,
+        polyfit_deg = POLYDEG,
+        idotp_min                = IDOTP_MIN,
+        calib_min_tic_bpi_ratio  = CALIB_TIC_BPI,
+        calib_min_cosine_sim     = CALIB_COS_SIM,
+        calib_min_rt_r2          = CALIB_RT_R2,
+        calib_min_dt_r2          = CALIB_DT_R2,
+        output_pdf_flag = lambda wc, output: (
+            f"--output_pdf {output.pdf}" if SAVE_PDF else ""
+        ),
+    resources:
+        mem_mb  = config["resources"]["identify"]["mem_mb"],
+        runtime = config["resources"]["identify"]["runtime"],
+        cpus    = config["resources"]["identify"]["cpus"],
+    log:
+        os.path.join(OUTDIR, "{run}", "logs", "{db}_identify.log"),
+    benchmark:
+        os.path.join(OUTDIR, "{run}", "benchmarks", "{db}_identify.tsv"),
+    shell:
+        """
+        {params.python} {params.identify} identify \
+            --isotopes          {input.isotopes} \
+            --database          {input.database} \
+            --output            {output.csv} \
+            {params.output_pdf_flag} \
+            --ppm_stage1        {params.ppm_stage1} \
+            --ppm_stage2        {params.ppm_stage2} \
+            --polyfit_deg       {params.polyfit_deg} \
+            --idotp_min                {params.idotp_min} \
+            --calib_min_tic_bpi_ratio  {params.calib_min_tic_bpi_ratio} \
+            --calib_min_cosine_sim     {params.calib_min_cosine_sim} \
+            --calib_min_rt_r2          {params.calib_min_rt_r2} \
+            --calib_min_dt_r2          {params.calib_min_dt_r2} \
+            --database_prebuilt \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks
+# ---------------------------------------------------------------------------
+
+onsuccess:
+    import shutil
+    if os.path.isdir(SLURM_LOGS):
+        shutil.rmtree(SLURM_LOGS)
+        print(f"[onsuccess] Deleted SLURM log directory: {SLURM_LOGS}")

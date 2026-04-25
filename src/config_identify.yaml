@@ -1,0 +1,94 @@
+# =============================================================================
+# config_identify.yaml — HDX-MS protein identification pipeline configuration
+# =============================================================================
+#
+# Usage
+# -----
+#   snakemake -s Snakefile_identify --configfile config_identify.yaml \
+#     --use-singularity --profile slurm
+#
+# All paths may be absolute or relative to the directory from which Snakemake
+# is launched (i.e. the hdx_ratefit_dev/ directory).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Infrastructure
+# ---------------------------------------------------------------------------
+
+# Singularity / Apptainer container image (same as main pipeline)
+singularity_image: "~/b1107/allan/software/containers/waters/waters_jupyter.sif"
+
+# Python executable inside the container
+python_exec: "python3"
+
+# ---------------------------------------------------------------------------
+# Inputs
+# ---------------------------------------------------------------------------
+# List every filtered (or calibrated) isotope CSV to be searched.
+# The stem of each file is used as the "run" name in output paths.
+# Typically point to *_isotopes_filtered.csv output by the main pipeline.
+
+isotope_files:
+  - "results/final/sample1_isotopes_filtered.csv"
+  - "results/final/sample2_isotopes_filtered.csv"
+  # Add more runs as needed
+
+# List every protein database CSV to search against.
+# Required columns: name, sequence.  Optional: MW (computed if absent).
+# The stem of each file is used as the "db" name in output paths.
+
+database_files:
+  - "/path/to/database1.csv"
+  - "/path/to/database2.csv"
+  # Add more databases as needed
+
+# ---------------------------------------------------------------------------
+# Output directories
+# ---------------------------------------------------------------------------
+# output_dir : root for per-run identification results
+#              layout: {output_dir}/{run}/{db}_identifications.csv
+# decoy_dir  : where pre-built target+decoy databases are cached
+#              (shared across all runs that use the same database)
+
+output_dir: "results/id"
+decoy_dir:  "results/id/decoys"
+
+# ---------------------------------------------------------------------------
+# Identification parameters
+# ---------------------------------------------------------------------------
+
+identification:
+  ppm_stage1:          50.0   # wide search window [ppm]
+  ppm_stage2:          10.0   # narrow search after polyfit re-calibration [ppm]
+  polyfit_deg:          2     # polynomial degree for m/z re-calibration
+  decoy_size:           2     # decoys generated per target protein
+  ppm_tol_decoy:       50.0   # minimum separation between decoy and target MWs [ppm]
+  save_diagnostics_pdf: true  # save per-run diagnostic PDF alongside identification CSV
+  idotp_min:           0.90   # minimum sequence-theoretical idotp (0 = report only, no filter)
+  calib_min_tic_bpi_ratio: 10.0  # min cluster_tic/cluster_bpi for calibration anchors
+  calib_min_cosine_sim:    0.98  # min averagine cosine_similarity for calibration anchors
+  calib_min_rt_r2:         0.9   # min rt_gaussian_r2 for calibration anchors
+  calib_min_dt_r2:         0.9   # min dt_gaussian_r2 for calibration anchors
+
+# ---------------------------------------------------------------------------
+# SLURM log directory
+# ---------------------------------------------------------------------------
+# Auto-deleted on successful pipeline completion (see onsuccess block).
+# Create before first launch: mkdir -p results/id/logs/slurm
+
+slurm_logs_dir: "results/id/logs/slurm"
+
+# ---------------------------------------------------------------------------
+# Cluster resources (SLURM)
+# ---------------------------------------------------------------------------
+
+resources:
+  generate_decoys:
+    mem_mb:  4000     # decoy generation is CPU-light; BioPython MW computation
+    runtime: 60       # minutes — generous for large databases
+    cpus:    1
+
+  identify:
+    mem_mb:  8000     # pandas + scipy; scales with isotope table size
+    runtime: 60       # minutes — two-stage search is fast for typical datasets
+    cpus:    1

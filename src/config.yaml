@@ -1,0 +1,250 @@
+# =============================================================================
+# config.yaml — HDX-MS isotope analysis pipeline configuration
+# =============================================================================
+#
+# Usage
+# -----
+#   snakemake --configfile config.yaml --use-singularity --profile slurm
+#
+# All paths may be absolute or relative to the directory from which Snakemake
+# is launched (i.e. the hdx_ratefit_dev/ directory).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Infrastructure
+# ---------------------------------------------------------------------------
+
+# MassLynx SDK license key file
+license_path: "../software/MassLynxSDKDownload_v5.0.0/license.key"
+
+# Singularity / Apptainer container image
+singularity_image: "~/b1107/allan/software/containers/waters/waters_jupyter.sif"
+
+# Python executable inside the Singularity container.
+# On most HPC clusters 'python' is not on PATH in SLURM jobs;
+# use 'python3' or the full path to your conda env interpreter.
+python_exec: "python3"
+
+# Working / scratch directory for per-slice temporary outputs
+# A subdirectory per sample will be created automatically.
+scratch_dir: "results/slices"
+
+# Final per-sample CSV output directory
+output_dir: "results/final"
+
+# Directory for per-cluster PNG plots
+plots_dir: "results/plots"
+
+
+# ---------------------------------------------------------------------------
+# Samples
+# ---------------------------------------------------------------------------
+# List every .raw file to be processed.  Use absolute paths or paths relative
+# to the Snakefile location.  The basename (without .raw) is used as the
+# sample name in output filenames.
+
+samples:
+  - "/path/to/sample1.raw"
+  - "/path/to/sample2.raw"
+  # Add more raw files as needed
+
+
+# ---------------------------------------------------------------------------
+# Data acquisition function
+# ---------------------------------------------------------------------------
+# 0-based function index.  Typically function 0 is the IMS/HDMSE function.
+
+function: 0
+
+
+# ---------------------------------------------------------------------------
+# Slice grid parameters
+# ---------------------------------------------------------------------------
+# DT : width = 50 drift bins, step = 25 bins  (50 % overlap)
+# RT : width = 1.0 min,       step = 0.5 min  (50 % overlap)
+# m/z: width = 100.0 Th,      step = 50.0 Th  (50 % overlap)
+
+slice:
+  dt_width: 50
+  dt_step:  25
+  rt_width: 1.0
+  rt_step:  0.5
+  mz_width: 100.0
+  mz_step:  50.0
+
+
+# ---------------------------------------------------------------------------
+# Chromatographic pre-filter  (applied by write_slice_list — optional)
+# ---------------------------------------------------------------------------
+# Fast first-pass run before batch jobs are submitted.  Uses the full
+# chromatographic TIC (all masses, all drift bins, single read_tic() call).
+# Its only purpose is to avoid submitting SLURM jobs for RT windows that are
+# completely silent (e.g. before or after the gradient).  It is NOT suitable
+# for tuning signal quality — use the 3-D thresholds below for that.
+#
+# Units: chromatographic TIC integrated over all m/z and all DT — values are
+# typically 1e7–1e9 for a real IMS-MS protein run.  Leave both at 0 (default)
+# unless you want to aggressively prune truly empty RT windows.
+
+pre_filter:
+  tic_min: 0   # chromatographic TIC sum; 0 = disabled (recommended)
+  bpi_min: 0   # chromatographic max-scan intensity; 0 = disabled (recommended)
+
+
+# ---------------------------------------------------------------------------
+# 3-D productivity thresholds  (applied inside every process_batch job)
+# ---------------------------------------------------------------------------
+# These are the meaningful signal-quality filters.  Applied to the actual
+# raw drift-scan data within [rt_lo,rt_hi] × [dt_lo,dt_hi] × [mz_lo,mz_hi]
+# BEFORE NTF runs — slices below either threshold write an empty CSV and exit.
+#
+# bpi_min : integrated m/z base-peak intensity — the maximum of the m/z
+#           profile after summing all RT scans and DT bins in the window.
+#           Directly comparable to what you see as the base peak in a
+#           composite spectrum in MassLynx for the same RT/DT/mz region.
+#
+# tic_min : total intensity of the whole 3-D tensor within the window
+#           (Σ over all RT, DT, and m/z).
+#
+# Both are reported as the 'bpi' and 'tic' columns in the isotopes DataFrame,
+# so run with 0 first, inspect the distribution in your results, then set
+# appropriate thresholds for your library.
+
+thresholds:
+  bpi_min: 0   # integrated m/z BPI (counts); 0 = process all slices
+  tic_min: 0   # 3-D window TIC (counts);      0 = process all slices
+
+
+# ---------------------------------------------------------------------------
+# Tensor build parameters
+# ---------------------------------------------------------------------------
+
+tensor:
+  mz_bin: 0.001          # reprofiling bin width [Da]
+  gauss_sigma_rt: 1.0    # RT smoothing sigma (0 = off)
+  gauss_sigma_dt: 1.0    # DT smoothing sigma (0 = off)
+  intensity_floor: 10.0  # zero bins below this value before NTF
+
+
+# ---------------------------------------------------------------------------
+# NTF / rank selection parameters
+# ---------------------------------------------------------------------------
+
+ntf:
+  rank_init: 5
+  rank_max: 15
+  corr_threshold: 0.17   # max allowed min-pairwise factor correlation
+  n_iter_max: 10000
+  n_restarts: 3
+  rt_r2_min: 0.85        # Gaussian fit R² threshold for RT mode
+  dt_r2_min: 0.85        # Gaussian fit R² threshold for DT mode
+
+
+# ---------------------------------------------------------------------------
+# Isotope analysis parameters
+# ---------------------------------------------------------------------------
+
+isotope:
+  charge_range: [3, 15]       # [z_min, z_max] inclusive
+  min_cosine: 0.5             # minimum cosine similarity to accept a cluster
+  min_peaks_per_cluster: 3    # minimum detected peaks per candidate group
+
+
+# ---------------------------------------------------------------------------
+# Output plots
+# ---------------------------------------------------------------------------
+# png_dpi    : DPI for saved images.  150 → ~300 KB/image; 100 → ~150 KB.
+#              With 20 000 slices × ~5 clusters each, 150→100 saves ~3 GB.
+#              72 gives maximum space savings with still-readable images.
+# plot_format: "png" (default) or "pdf".  PDF gives vector graphics and is
+#              better for publication; PNG is faster and smaller for browsing.
+# save_clusters: save one image per isotopic cluster (the standard output).
+# save_factors : save factor-level diagnostic plots per slice (raw tensor,
+#               NTF factors, and factor correlations).  These are stored in
+#               plots/{sample}/factors/ and are useful for quality control
+#               but can be large; disable for routine production runs.
+
+plots:
+  png_dpi: 100
+  plot_format: "png"     # "png" or "pdf"
+  save_clusters: true    # per-cluster isotope envelope plots
+  save_factors: false    # factor-level diagnostic plots (raw + NTF + corr)
+
+
+# ---------------------------------------------------------------------------
+# Lock-mass calibration
+# ---------------------------------------------------------------------------
+# Run once per sample via the 'calibrate_lockmass' Snakemake rule, then
+# applied to the final aggregate CSV via 'apply_calibration'.
+
+calibration:
+  compound:      "SodiumFormate"   # reference compound (SodiumFormate | GluFibFragments)
+  n_chunks:      6                 # number of equal RT windows for calibration
+  polyfit_deg:   1                 # polynomial degree (1 = linear, default)
+  ppm_radius:    100.0             # peak search window [ppm]
+  min_intensity: 1000.0            # minimum Gaussian amplitude to accept a peak
+  mz_min:        50.0              # lower m/z bound for theoretical masses
+  mz_max:        2200.0            # upper m/z bound for theoretical masses
+
+
+# ---------------------------------------------------------------------------
+# Post-aggregate quality filters  (applied by the apply_filters Snakemake rule)
+# ---------------------------------------------------------------------------
+# These are applied after the aggregate + calibration steps to produce
+# *_isotopes_filtered.csv.  All conditions must pass simultaneously.
+#
+# cluster_bpi_min         : minimum cluster_bpi (base peak intensity from NTF spectrum)
+# cluster_tic_bpi_ratio_min: minimum cluster_tic / cluster_bpi; a proxy for peak
+#                            width — very narrow (noise-like) peaks have ratio ≈1
+# rt_gaussian_r2_min      : RT Gaussian R²; 1.0 = perfect Gaussian shape
+# dt_gaussian_r2_min      : DT Gaussian R²; 1.0 = perfect Gaussian shape
+# rt_edge_margin          : RT centre must be ≥ this many minutes from the slice edge
+# dt_edge_margin          : DT centre must be ≥ this many bins from the slice edge
+
+filters:
+  cluster_bpi_min:           5.0e+3
+  cluster_tic_bpi_ratio_min: 10.0
+  rt_gaussian_r2_min:        0.9
+  dt_gaussian_r2_min:        0.9
+  rt_edge_margin:            0.1     # minutes
+  dt_edge_margin:            5.0     # drift bins
+
+
+# ---------------------------------------------------------------------------
+# Batch size
+# ---------------------------------------------------------------------------
+# Number of slices processed sequentially inside each process_batch SLURM job.
+# Higher values = fewer DAG nodes and fewer SLURM submissions (faster dry-run
+# and launch), at the cost of longer per-job wall time.
+# Rule of thumb: batch_size × (typical per-slice runtime) < SLURM runtime limit.
+# With ~3 min/slice avg and short partition limit of 4 h: batch_size ≤ 80.
+
+batch_size: 50
+
+
+# ---------------------------------------------------------------------------
+# Cluster resources (SLURM / SGE / PBS)
+# ---------------------------------------------------------------------------
+# These values are passed to the cluster profile; adjust for your HPC.
+
+resources:
+  process_batch:
+    mem_mb: 8000        # 8 GB — same as single-slice (slices run sequentially)
+    runtime: 240        # minutes — covers batch_size=50 at ~3 min/slice avg
+    cpus: 1
+  scan_metrics:
+    mem_mb: 4000
+    runtime: 120
+    cpus: 1
+  aggregate:
+    mem_mb: 4000
+    runtime: 30
+    cpus: 1
+  calibrate_lockmass:
+    mem_mb: 8000        # tensor build for the lock-mass function
+    runtime: 30
+    cpus: 1
+  apply_calibration:
+    mem_mb: 4000
+    runtime: 15
+    cpus: 1
