@@ -11,6 +11,33 @@ import pytest
 from hdmse_library import extract_anchor
 
 
+def test_extract_anchor_raises_on_zero_vec(axes):
+    zero = np.zeros(len(axes["rt"]), dtype=np.float32)
+    valid_b = np.ones(len(axes["dt"]), dtype=np.float32)
+    with pytest.raises(ValueError, match="extract_anchor"):
+        extract_anchor(
+            a_vec=zero,
+            b_vec=valid_b,
+            rt_axis=axes["rt"],
+            dt_axis=axes["dt"],
+        )
+
+
+def test_extract_anchor_truncated_gaussian(axes):
+    """Truncated profile (peak near axis edge) should not raise and should
+    return normalized vectors with centroid within the axis bounds."""
+    # Gaussian centered at axis start → heavily left-truncated
+    rt = axes["rt"]
+    dt = axes["dt"]
+    a_trunc = np.exp(-0.5 * ((rt - rt[0]) / 0.05) ** 2).astype(np.float32)
+    b_trunc = np.exp(-0.5 * ((dt - dt[10]) / 3.0) ** 2).astype(np.float32)
+    anchor = extract_anchor(a_vec=a_trunc, b_vec=b_trunc, rt_axis=rt, dt_axis=dt)
+    assert rt[0] <= anchor["rt_center"] <= rt[-1]
+    assert dt[0] <= anchor["dt_center"] <= dt[-1]
+    assert np.linalg.norm(anchor["a_norm"]) == pytest.approx(1.0, abs=1e-5)
+    assert np.linalg.norm(anchor["b_norm"]) == pytest.approx(1.0, abs=1e-5)
+
+
 def test_extract_anchor_recovers_planted_centroids(axes, planted_precursor_anchor):
     anchor = extract_anchor(
         a_vec=planted_precursor_anchor["a_vec"],

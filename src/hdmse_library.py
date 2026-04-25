@@ -13,7 +13,8 @@ runs only inside the x86-64 Singularity container.
 
 Phases (per the design spec)
 ----------------------------
-* Phase 2 — ``extract_anchor``: RT/DT centroid + sigma from one LCE factor.
+* Phase 2 — ``extract_anchor``: RT/DT centroid, sigma, and L2-normalized
+            RT/DT vectors (a_norm, b_norm) from one LCE factor.
 * Phase 3 — ``project_anchor_onto_hce``: weighted projection of the
             factor's outer-product RT×DT signature onto an HCE m/z slab,
             yielding a per-m/z Pearson rho and projected intensity profile.
@@ -60,25 +61,25 @@ def extract_anchor(
     dict with keys
         ``rt_center``, ``rt_sigma`` : float — RT centroid and stddev (min)
         ``dt_center``, ``dt_sigma`` : float — DT centroid and stddev (bins)
-        ``a_norm`` : float32 (n_rt,) — L2-normalized a_vec
-        ``b_norm`` : float32 (n_dt,) — L2-normalized b_vec
+        ``a_norm`` : ndarray of float32, shape (n_rt,) — L2-normalized a_vec
+        ``b_norm`` : ndarray of float32, shape (n_dt,) — L2-normalized b_vec
     """
     a = np.asarray(a_vec, dtype=np.float64)
     b = np.asarray(b_vec, dtype=np.float64)
     rt = np.asarray(rt_axis, dtype=np.float64)
     dt = np.asarray(dt_axis, dtype=np.float64)
 
-    a_sum = float(a.sum())
-    b_sum = float(b.sum())
+    a_sum = a.sum()
+    b_sum = b.sum()
     if a_sum <= 0 or b_sum <= 0:
         raise ValueError("extract_anchor: a_vec or b_vec has non-positive sum")
 
-    rt_center = float(np.dot(a, rt) / a_sum)
-    dt_center = float(np.dot(b, dt) / b_sum)
-    rt_var = float(np.dot(a, (rt - rt_center) ** 2) / a_sum)
-    dt_var = float(np.dot(b, (dt - dt_center) ** 2) / b_sum)
-    rt_sigma = float(np.sqrt(max(rt_var, 0.0)))
-    dt_sigma = float(np.sqrt(max(dt_var, 0.0)))
+    rt_center = np.dot(a, rt) / a_sum
+    dt_center = np.dot(b, dt) / b_sum
+    rt_var = np.dot(a, (rt - rt_center) ** 2) / a_sum
+    dt_var = np.dot(b, (dt - dt_center) ** 2) / b_sum
+    rt_sigma = np.sqrt(max(rt_var, 0.0))
+    dt_sigma = np.sqrt(max(dt_var, 0.0))
 
     a_norm = (a / np.linalg.norm(a)).astype(np.float32)
     b_norm = (b / np.linalg.norm(b)).astype(np.float32)
