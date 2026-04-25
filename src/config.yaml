@@ -248,3 +248,24 @@ resources:
     mem_mb: 4000
     runtime: 15
     cpus: 1
+
+# ---------------------------------------------------------------------------
+# HDMS^E anchor-and-project library  (consumed by src/hdmse_pipeline.py)
+# ---------------------------------------------------------------------------
+# Builds a pseudo-MS2 fragment library from interleaved low/high collision
+# energy data (Function 0 = LCE precursors, Function 1 = HCE fragments).
+# Fragmentation occurs post-mobility, so genuine fragments share their
+# precursor's RT and IM distributions — quantified here by Pearson rho.
+
+hdmse:
+  lce_function: 0          # 0-based function index for LCE (precursors)
+  hce_function: 1          # 0-based function index for HCE (fragments)
+  lce_mz_window: 50.0      # width of each LCE NTF window [Da]
+  lce_mz_step: 50.0        # step between LCE windows [Da] — 50 = no overlap
+  hce_mz_lo: 100.0         # lowest HCE m/z to search for fragments [Da]
+  hce_mz_hi: 2000.0        # highest HCE m/z to search for fragments [Da]
+  hce_mz_slab: 100.0       # HCE m/z slab size for chunked tensor build [Da]
+  rho_threshold: 0.85      # Pearson rho cutoff for keeping a fragment
+  min_fragment_intensity: 50.0   # minimum projected intensity per fragment
+  peak_distance_da: 0.5    # minimum m/z separation between accepted peaks
+  output_path: "results/hdmse/{sample}_library.parquet"
