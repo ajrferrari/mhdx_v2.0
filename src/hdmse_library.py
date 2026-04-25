@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Dict, List
 
 import numpy as np
+import pandas as pd
 from scipy.signal import find_peaks as _find_peaks
 
 
@@ -202,6 +203,8 @@ def extract_fragments(
     if mz.shape != rho_a.shape or mz.shape != inten.shape:
         raise ValueError("mz_axis, rho, and intensity must have identical shape")
 
+    if len(mz) == 0 or inten.size == 0:
+        return []
     if inten.max() <= 0:
         return []
 
@@ -304,6 +307,5 @@ def write_library_parquet(rows: List[Dict[str, object]], output_path: str) -> No
     ``mz``, ``intensity``, ``rho`` are preserved without row explosion.
     An empty ``rows`` list produces an empty Parquet with the correct schema.
     """
-    import pandas as pd
     df = pd.DataFrame(rows, columns=list(LIBRARY_SCHEMA))
     df.to_parquet(output_path, engine="pyarrow", index=False)
