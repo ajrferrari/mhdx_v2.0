@@ -139,14 +139,14 @@ def project_anchor_onto_hce(
     H_flat = H.reshape(n_rt * n_dt, n_mz)                        # (N, n_mz)
     n = float(anchor_flat.size)
 
-    intensity = (anchor_flat @ H_flat).astype(np.float32)        # (n_mz,)
+    sum_ah = anchor_flat @ H_flat                                  # (n_mz,)
+    intensity = sum_ah.astype(np.float32)                         # (n_mz,)
 
     # Pearson: rho = (n·Σxy − Σx·Σy) / sqrt((n·Σx² − (Σx)²)·(n·Σy² − (Σy)²))
     sum_a = float(anchor_flat.sum())
     sum_a2 = float((anchor_flat * anchor_flat).sum())
     sum_h = H_flat.sum(axis=0)              # (n_mz,)
     sum_h2 = (H_flat * H_flat).sum(axis=0)  # (n_mz,)
-    sum_ah = anchor_flat @ H_flat           # (n_mz,)
 
     num = n * sum_ah - sum_a * sum_h
     den_a = n * sum_a2 - sum_a * sum_a
