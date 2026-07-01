@@ -685,9 +685,11 @@ def _gauss_func(
 def _fit_gauss_r2(x: np.ndarray, y: np.ndarray) -> float:
     """Fit a Gaussian to *y(x)* and return the R² of the fit.
 
-    Returns 0.0 if fewer than 4 points, all-zero, or fit fails.
+    Returns 0.0 if fewer than 3 points, all-zero, or fit fails.
+    For exactly 3 points the fit is fully determined; R² is capped at 0.95 to
+    avoid a perfect-fit false positive.
     """
-    if len(y) < 4 or np.max(y) <= 0:
+    if len(y) < 3 or np.max(y) <= 0:
         return 0.0
     y_norm = y / (np.max(y) + 1e-12)   # normalize for numerical stability
     x0_guess = float(x[np.argmax(y_norm)])
@@ -707,7 +709,10 @@ def _fit_gauss_r2(x: np.ndarray, y: np.ndarray) -> float:
         ss_tot = float(np.sum((y_norm - y_norm.mean()) ** 2))
         if ss_tot < 1e-12:
             return 0.0
-        return max(0.0, 1.0 - ss_res / ss_tot)
+        r2 = max(0.0, 1.0 - ss_res / ss_tot)
+        if len(y) == 3:
+            r2 = min(r2, 0.95)
+        return r2
     except Exception:
         return 0.0
 

@@ -773,6 +773,11 @@ def _assign_charge(
         mono_mass_da = best_mono_mz * z - z * PROTON
         n_obs = int((obs_at_best > 0.05 * (obs_at_best.max() + 1e-12)).sum())
 
+        # 2-peak clusters have lower cosine discriminating power; apply a
+        # stricter threshold to avoid accepting ambiguous assignments.
+        if n_obs < 3 and best_cos < max(min_cosine, 0.70):
+            continue
+
         # ------------------------------------------------------------------
         # Gap penalty: penalise z/2 aliases by checking inter-stick signal.
         # For z=5 aliasing z=10: every z=10 peak sits at the midpoint between

@@ -972,6 +972,60 @@ def write_slice_list(
 
 
 # ---------------------------------------------------------------------------
+# complete_charge_families: recover sibling charge states
+# ---------------------------------------------------------------------------
+
+def complete_charge_families(
+    filtered: "pd.DataFrame",
+    unfiltered: "pd.DataFrame",
+    mw_ppm: float = 20.0,
+    rt_tol: float = 0.3,
+) -> "pd.DataFrame":
+    """Add sibling charge states for proteins already present in filtered output.
+
+    For each k=0 row in *filtered*, searches *unfiltered* for rows with the
+    same monoisotopic MW (within *mw_ppm*) and RT (within *rt_tol*) but a
+    different charge state.  Rows not already in *filtered* are appended with
+    ``is_family_completion=True``.
+    """
+    import numpy as np
+    import pandas as pd
+
+    filtered = filtered.copy()
+    if "is_family_completion" not in filtered.columns:
+        filtered["is_family_completion"] = False
+
+    anchors = filtered[filtered["k"] == 0].reset_index(drop=True)
+    additions: list[pd.Series] = []
+
+    for _, anchor in anchors.iterrows():
+        mw  = float(anchor["monoisotopic_mass_da"])
+        rt  = float(anchor["rt_center"])
+        z0  = int(anchor["charge"])
+
+        dm   = np.abs(unfiltered["monoisotopic_mass_da"] - mw) / (mw + 1e-12) * 1e6
+        drt  = np.abs(unfiltered["rt_center"] - rt)
+        mask = (dm <= mw_ppm) & (drt <= rt_tol) & (unfiltered["charge"] != z0) & (unfiltered["k"] == 0)
+        siblings = unfiltered[mask]
+
+        for _, sib in siblings.iterrows():
+            sib_mz = float(sib["monoisotopic_mz"])
+            sib_z  = int(sib["charge"])
+            already = (
+                (np.abs(filtered["monoisotopic_mz"] - sib_mz) / (sib_mz + 1e-12) * 1e6 <= 10.0)
+                & (np.abs(filtered["rt_center"] - rt) <= rt_tol)
+                & (filtered["charge"] == sib_z)
+            )
+            if not already.any():
+                new_row = sib.copy()
+                new_row["is_family_completion"] = True
+                additions.append(new_row)
+
+    if additions:
+        return pd.concat([filtered, pd.DataFrame(additions)], ignore_index=True)
+    return filtered
+
+
 # apply_filters: post-aggregate quality filter
 # ---------------------------------------------------------------------------
 
@@ -1204,6 +1258,19 @@ if __name__ == "__main__":
     p_filt.add_argument("--dt_edge_margin",           type=float, default=5.0,
                         help="DT edge guard in drift bins (default: 5)")
 
+    p_fam = sub.add_parser("complete_families",
+                           help="Add sibling charge states for detected proteins")
+    p_fam.add_argument("--filtered_csv",   required=True,
+                       help="Quality-filtered isotopes CSV (*_isotopes_filtered.csv)")
+    p_fam.add_argument("--unfiltered_csv", required=True,
+                       help="Pre-filter aggregate CSV (*_isotopes.csv)")
+    p_fam.add_argument("--output_csv",     required=True,
+                       help="Output CSV with sibling charge states appended")
+    p_fam.add_argument("--mw_ppm",  type=float, default=20.0,
+                       help="MW tolerance in ppm for grouping charge states (default: 20)")
+    p_fam.add_argument("--rt_tol",  type=float, default=0.3,
+                       help="RT tolerance in minutes (default: 0.3)")
+
     args = parser.parse_args()
 
     if args.cmd == "process_slice":
@@ -1339,3 +1406,16 @@ if __name__ == "__main__":
             rt_edge_margin=args.rt_edge_margin,
             dt_edge_margin=args.dt_edge_margin,
         )
+
+    elif args.cmd == "complete_families":
+        import pandas as pd
+        filtered   = pd.read_csv(args.filtered_csv)
+        unfiltered = pd.read_csv(args.unfiltered_csv)
+        result = complete_charge_families(
+            filtered, unfiltered,
+            mw_ppm=args.mw_ppm,
+            rt_tol=args.rt_tol,
+        )
+        result.to_csv(args.output_csv, index=False)
+        n_added = int(result.get("is_family_completion", pd.Series(dtype=bool)).sum())
+        print(f"complete_families: {n_added} sibling charge states added → {args.output_csv}")

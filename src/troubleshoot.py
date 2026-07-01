@@ -927,11 +927,300 @@ def inspect_slice(
 
 
 # ---------------------------------------------------------------------------
+# trace_missing_signal: per-signal diagnostic tracer
+# ---------------------------------------------------------------------------
+
+def trace_missing_signal(
+    raw_path: str,
+    license_path: str,
+    obs_mz: float,
+    charge: int,
+    rt: float,
+    im_mono: float,
+    config: Dict,
+    function: int = 0,
+    mz_ppm: float = 10.0,
+    rt_tol: float = 0.3,
+    dt_tol: float = 10.0,
+    verbose: bool = False,
+) -> Dict:
+    """Trace why a reference signal is absent from the pipeline output.
+
+    Finds all slices that contain the target (obs_mz, RT, im_mono) position,
+    re-runs each pipeline stage on those slices, and reports the furthest
+    stage the signal reached before being dropped.
+
+    Returns a dict with keys:
+        lost_at       : one of 'bpi_tic' | 'ntf_no_factors' | 'ntf_gaussian' |
+                        'isotope_min_peaks' | 'isotope_cosine' | 'post_filter' |
+                        'recovered' | 'not_in_any_slice'
+        n_slices      : number of overlapping slices examined
+        best_cosine   : best cosine found across all slices (None if never reached)
+        ntf_factors   : (n_factors, n_passing_gauss) tuple for the best slice
+        slice_coords  : (rt_lo, rt_hi, dt_lo, dt_hi, mz_lo, mz_hi) of the best slice
+    """
+    from pipeline import generate_slice_grid, _process_slice_inner, _compute_slice_bpi_tic
+    from tensor_analysis import analyze_chunk
+    from isotope_analysis import find_isotopic_clusters
+    from waters_reader import WatersRawReader, read_license
+
+    ntf_cfg   = config.get("ntf", {})
+    iso_cfg   = config.get("isotope", {})
+    filt_cfg  = config.get("filters", {})
+    tsr_cfg   = config.get("tensor", {})
+
+    license_key = read_license(license_path)
+
+    # Determine overlapping slices
+    grid = generate_slice_grid(raw_path, license_path, config)
+    candidates = [
+        s for s in grid
+        if s["mz_lo"] <= obs_mz <= s["mz_hi"]
+        and s["rt_lo"] <= rt <= s["rt_hi"]
+        and s["dt_lo"] <= im_mono <= s["dt_hi"]
+    ]
+
+    if not candidates:
+        return {"lost_at": "not_in_any_slice", "n_slices": 0,
+                "best_cosine": None, "ntf_factors": None, "slice_coords": None}
+
+    # Run each slice and track the furthest stage reached
+    stage_order = [
+        "not_in_any_slice", "bpi_tic", "ntf_no_factors", "ntf_gaussian",
+        "isotope_min_peaks", "isotope_cosine", "post_filter", "recovered",
+    ]
+
+    best: Dict = {"lost_at": "bpi_tic", "n_slices": len(candidates),
+                  "best_cosine": None, "ntf_factors": None, "slice_coords": None}
+
+    with WatersRawReader(raw_path, license=license_key) as reader:
+        for s in candidates:
+            result = _trace_one_slice(
+                reader, s, obs_mz, charge, rt, im_mono,
+                function, ntf_cfg, iso_cfg, filt_cfg, tsr_cfg,
+                mz_ppm, rt_tol, dt_tol, verbose,
+            )
+            if stage_order.index(result["lost_at"]) > stage_order.index(best["lost_at"]):
+                best = result
+                best["n_slices"] = len(candidates)
+
+    return best
+
+
+def _trace_one_slice(
+    reader,
+    s: Dict,
+    obs_mz: float,
+    charge: int,
+    rt: float,
+    im_mono: float,
+    function: int,
+    ntf_cfg: Dict,
+    iso_cfg: Dict,
+    filt_cfg: Dict,
+    tsr_cfg: Dict,
+    mz_ppm: float,
+    rt_tol: float,
+    dt_tol: float,
+    verbose: bool,
+) -> Dict:
+    """Run all pipeline stages on one slice; return at which stage signal is lost."""
+    from tensor_analysis import analyze_chunk
+    from isotope_analysis import find_isotopic_clusters
+    from pipeline import _compute_slice_bpi_tic
+
+    coords = (s["rt_lo"], s["rt_hi"], s["dt_lo"], s["dt_hi"], s["mz_lo"], s["mz_hi"])
+    base   = {"slice_coords": coords, "best_cosine": None, "ntf_factors": None}
+
+    # Stage 1 — BPI/TIC gate
+    bpi, tic = _compute_slice_bpi_tic(
+        reader, function,
+        s["rt_lo"], s["rt_hi"], s["dt_lo"], s["dt_hi"], s["mz_lo"], s["mz_hi"],
+    )
+    bpi_min = filt_cfg.get("bpi_min", 0.0)
+    tic_min = filt_cfg.get("tic_min", 0.0)
+    if bpi < bpi_min or tic < tic_min:
+        return {**base, "lost_at": "bpi_tic"}
+
+    # Stage 2 — NTF
+    chunk = analyze_chunk(
+        reader, function,
+        s["rt_lo"], s["rt_hi"], s["dt_lo"], s["dt_hi"], s["mz_lo"], s["mz_hi"],
+        mz_bin=tsr_cfg.get("mz_bin", 0.001),
+        gauss_sigma_rt=tsr_cfg.get("gauss_sigma_rt", 1.0),
+        gauss_sigma_dt=tsr_cfg.get("gauss_sigma_dt", 1.0),
+        intensity_floor=tsr_cfg.get("intensity_floor", 10.0),
+        rank_init=ntf_cfg.get("rank_init", 5),
+        corr_threshold=ntf_cfg.get("corr_threshold", 0.17),
+        n_iter_max=ntf_cfg.get("n_iter_max", 10000),
+        rank_max=ntf_cfg.get("rank_max", 15),
+        n_restarts=ntf_cfg.get("n_restarts", 3),
+        rt_r2_min=ntf_cfg.get("rt_r2_min", 0.75),
+        dt_r2_min=ntf_cfg.get("dt_r2_min", 0.75),
+        verbose=verbose,
+    )
+
+    A = chunk.get("A")
+    if A is None or A.shape[1] == 0:
+        return {**base, "lost_at": "ntf_no_factors"}
+
+    n_total   = chunk.get("n_factors_raw", A.shape[1])
+    n_passing = A.shape[1]
+    base["ntf_factors"] = (n_total, n_passing)
+
+    if n_passing == 0:
+        return {**base, "lost_at": "ntf_gaussian"}
+
+    # Stage 3 — isotope detection
+    mz_axis = chunk.get("mz_axis")
+    if mz_axis is None:
+        return {**base, "lost_at": "ntf_no_factors"}
+
+    charge_range = tuple(iso_cfg.get("charge_range", [2, 15]))
+    min_cosine   = iso_cfg.get("min_cosine", 0.5)
+    min_peaks    = iso_cfg.get("min_peaks_per_cluster", 2)
+
+    clusters_all = find_isotopic_clusters(
+        mz_axis, chunk["C"],
+        charge_range=charge_range,
+        min_cosine=min_cosine,
+        min_peaks_per_cluster=min_peaks,
+    )
+
+    if not clusters_all:
+        # Check if it failed at min_peaks or cosine by trying with relaxed params
+        clusters_relaxed = find_isotopic_clusters(
+            mz_axis, chunk["C"],
+            charge_range=charge_range,
+            min_cosine=0.1,
+            min_peaks_per_cluster=2,
+        )
+        if clusters_relaxed:
+            return {**base, "lost_at": "isotope_min_peaks"}
+        return {**base, "lost_at": "isotope_cosine"}
+
+    # Check if the target signal is among detected clusters
+    import numpy as np
+    best_cosine = None
+    for cluster in clusters_all:
+        if int(cluster.get("charge", 0)) != charge:
+            continue
+        cmz = float(cluster.get("monoisotopic_mz", 0.0))
+        ppm = abs(cmz - obs_mz) / (obs_mz + 1e-12) * 1e6
+        if ppm <= mz_ppm:
+            cos = float(cluster.get("cosine_similarity", 0.0))
+            if best_cosine is None or cos > best_cosine:
+                best_cosine = cos
+
+    base["best_cosine"] = best_cosine
+
+    if best_cosine is None:
+        return {**base, "lost_at": "isotope_cosine"}
+
+    # Stage 4 — post-filter (check quality criteria)
+    # The rt/dt R² values come from the NTF factor, not the cluster directly.
+    # Check the factor R² for the factor this cluster was detected in.
+    rt_r2_min = filt_cfg.get("rt_gaussian_r2_min", 0.80)
+    dt_r2_min = filt_cfg.get("dt_gaussian_r2_min", 0.80)
+    factor_r2 = chunk.get("factor_quality", [])
+    if factor_r2:
+        any_good = any(
+            q.get("rt_r2", 0) >= rt_r2_min and q.get("dt_r2", 0) >= dt_r2_min
+            for q in factor_r2
+        )
+        if not any_good:
+            return {**base, "lost_at": "post_filter"}
+
+    return {**base, "lost_at": "recovered"}
+
+
+def batch_trace_missing(
+    raw_path: str,
+    license_path: str,
+    unmatched_csv: str,
+    config: Dict,
+    n_signals: int = 50,
+    output_csv: str = "trace_report.csv",
+    function: int = 0,
+) -> None:
+    """Run trace_missing_signal on the first n_signals rows of unmatched_csv."""
+    import pandas as pd
+
+    unmatched = pd.read_csv(unmatched_csv).head(n_signals)
+    print(f"Tracing {len(unmatched)} missing signals from {unmatched_csv}")
+
+    records = []
+    for i, row in unmatched.iterrows():
+        if i % 10 == 0:
+            print(f"  {i}/{len(unmatched)} …")
+        result = trace_missing_signal(
+            raw_path, license_path,
+            obs_mz=float(row["obs_mz"]),
+            charge=int(row["charge"]),
+            rt=float(row["RT"]),
+            im_mono=float(row["im_mono"]),
+            config=config,
+            function=function,
+        )
+        records.append({
+            "name":             row.get("name", ""),
+            "obs_mz":           row["obs_mz"],
+            "charge":           row["charge"],
+            "RT":               row["RT"],
+            "im_mono":          row["im_mono"],
+            "lost_at":          result["lost_at"],
+            "best_cosine":      result["best_cosine"],
+            "ntf_n_factors":    result["ntf_factors"][0] if result["ntf_factors"] else None,
+            "ntf_passing_gauss": result["ntf_factors"][1] if result["ntf_factors"] else None,
+            "n_slices":         result["n_slices"],
+        })
+
+    df = pd.DataFrame(records)
+    df.to_csv(output_csv, index=False)
+    print(f"\nTrace report saved to {output_csv}")
+    print("\nlost_at breakdown:")
+    print(df["lost_at"].value_counts().to_string())
+
+
 # CLI entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
+    import sys
+
+    # Dispatch to trace_missing subcommand if requested
+    if len(sys.argv) > 1 and sys.argv[1] == "trace_missing":
+        import yaml
+        tp = argparse.ArgumentParser(
+            description="Batch-trace missing signals against the pipeline.",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
+        tp.add_argument("raw_path",       help="Path to Waters .raw directory")
+        tp.add_argument("license_path",   help="Path to MassLynx license key file")
+        tp.add_argument("unmatched_csv",  help="CSV of unmatched reference signals")
+        tp.add_argument("--config",       default="src/config.yaml",
+                        help="Pipeline config YAML")
+        tp.add_argument("--n_signals",    type=int, default=50,
+                        help="Number of signals to trace")
+        tp.add_argument("--output",       default="trace_report.csv",
+                        help="Output CSV path")
+        tp.add_argument("--function",     type=int, default=0)
+        targs = tp.parse_args(sys.argv[2:])
+
+        with open(targs.config) as f:
+            cfg = yaml.safe_load(f)
+
+        batch_trace_missing(
+            raw_path=targs.raw_path,
+            license_path=targs.license_path,
+            unmatched_csv=targs.unmatched_csv,
+            config=cfg,
+            n_signals=targs.n_signals,
+            output_csv=targs.output,
+            function=targs.function,
+        )
+        sys.exit(0)
 
     p = argparse.ArgumentParser(
         description="Troubleshoot a single RT×DT×m/z slice from a Waters .raw file.",
