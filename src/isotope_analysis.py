@@ -579,15 +579,17 @@ def _integrate_isotope_peaks(
     k=1 assignments) the integration yields ~0 from background noise.
     """
     spacing = NEUTRON / charge
-    result = np.zeros(n_peaks, dtype=np.float64)
+    cs_max  = len(cs_smooth) - 1          # hard upper bound regardless of fine_N
+    result  = np.zeros(n_peaks, dtype=np.float64)
     for i in range(n_peaks):
         mz_i = mono_mz + i * spacing
         half_da = mz_i * ppm * 1e-6
         half_bins = max(1, round(half_da / fine_step))
         idx = int(round((mz_i - fine_lo) / fine_step))
         lo = max(0, idx - half_bins)
-        hi = min(fine_N, idx + half_bins + 1)
-        result[i] = cs_smooth[hi] - cs_smooth[lo]
+        hi = min(cs_max, idx + half_bins + 1)
+        if hi > lo:
+            result[i] = cs_smooth[hi] - cs_smooth[lo]
     mx = result.max()
     if mx > 0:
         result /= mx
