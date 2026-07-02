@@ -1,0 +1,133 @@
+# =============================================================================
+# config_diagnostic.yaml — gap analysis + parallel signal tracer + family
+#                          completion workflow configuration
+# =============================================================================
+#
+# Usage
+# -----
+#   snakemake -s src/Snakefile_diagnostic \
+#     --configfile src/config_diagnostic.yaml \
+#     -j 500 --keep-going \
+#     --use-singularity \
+#     --singularity-args "--bind /projects/b1107,/scratch/ajf4103" \
+#     --cluster "sbatch -A p31346 -p short -N 1 -n {resources.cpus} \
+#                --mem={resources.mem_mb}M -t {resources.runtime} \
+#                --output results/diagnostic/logs/slurm-%j.out \
+#                --error  results/diagnostic/logs/slurm-%j.err" \
+#     --max-jobs-per-second 3 \
+#     --latency-wait 60 \
+#     --rerun-incomplete
+#
+# Create the log directory before first run:
+#   mkdir -p results/diagnostic/logs/slurm
+#
+# Dependencies
+# ------------
+# This workflow requires the main pipeline outputs to already exist:
+#   results/final/{sample}_isotopes_filtered.csv   (from Snakefile apply_filters)
+#   results/final/{sample}_isotopes_cal.csv         (from Snakefile apply_calibration)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Infrastructure
+# ---------------------------------------------------------------------------
+
+singularity_image: "~/b1107/allan/software/containers/waters/waters_jupyter.sif"
+python_exec:       "python3"
+license_path:      "../software/MassLynxSDKDownload_v5.0.0/license.key"
+
+# Path to main pipeline config (passed through to the signal tracer so it
+# uses the same NTF / isotope / filter parameters as the original pipeline)
+main_config: "src/config.yaml"
+
+
+# ---------------------------------------------------------------------------
+# Samples
+# ---------------------------------------------------------------------------
+# Map sample stem (= output filename prefix) to the Waters .raw directory.
+# Must match the sample stems used in the main pipeline run.
+
+samples:
+  260107_AF2501_0: "data/260107_AF2501_0.raw"
+
+
+# ---------------------------------------------------------------------------
+# Reference CSVs (ground-truth identified signals per sample)
+# ---------------------------------------------------------------------------
+# These are the intermediate identification files used for gap analysis.
+# Required columns: name, RT, im_mono, ab_cluster_total, MW, charge, obs_mz.
+
+reference_csvs:
+  260107_AF2501_0: "data/260107_AF2501_0.mzML_intermediate.csv"
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline output paths (inputs to this workflow)
+# ---------------------------------------------------------------------------
+# {sample} is expanded by Snakemake — do not change the placeholder.
+
+isotopes_filtered_pattern: "results/final/{sample}_isotopes_filtered.csv"
+isotopes_cal_pattern:      "results/final/{sample}_isotopes_cal.csv"
+
+
+# ---------------------------------------------------------------------------
+# Output directory
+# ---------------------------------------------------------------------------
+
+diagnostic_dir: "results/diagnostic"
+
+
+# ---------------------------------------------------------------------------
+# Gap analysis tolerances
+# ---------------------------------------------------------------------------
+# Used to decide which reference signals are "matched" by the pipeline.
+
+gap:
+  mz_ppm: 10.0   # m/z tolerance [ppm]
+  rt_tol:  0.3   # RT tolerance [min]
+
+
+# ---------------------------------------------------------------------------
+# Signal tracer parameters
+# ---------------------------------------------------------------------------
+# batch_size : number of unmatched signals per SLURM job.  Each signal
+#              re-runs NTF on the relevant slices — budget ~2 min/signal.
+#              batch_size=25 → ~50 min/job, well within a 120 min runtime.
+
+tracer:
+  batch_size: 25
+
+
+# ---------------------------------------------------------------------------
+# Charge-state family completion tolerances
+# ---------------------------------------------------------------------------
+
+family:
+  mw_ppm: 20.0   # MW grouping tolerance [ppm]
+  rt_tol:  0.3   # RT window for sibling search [min]
+
+
+# ---------------------------------------------------------------------------
+# Cluster resources (SLURM)
+# ---------------------------------------------------------------------------
+
+resources:
+  gap_analysis:
+    mem_mb:  4000
+    runtime: 30
+    cpus:    1
+
+  trace_batch:
+    mem_mb:  8000    # NTF needs ~4–6 GB; 8 GB gives headroom
+    runtime: 120     # 25 signals × ~2 min/signal + NTF overhead
+    cpus:    1
+
+  aggregate:
+    mem_mb:  4000
+    runtime: 15
+    cpus:    1
+
+  complete_families:
+    mem_mb:  4000
+    runtime: 15
+    cpus:    1

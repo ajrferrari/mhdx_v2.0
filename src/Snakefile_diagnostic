@@ -1,0 +1,272 @@
+# =============================================================================
+# Snakefile_diagnostic — gap analysis + parallel signal tracer + family
+#                        completion for the HDX-MS isotope pipeline
+# =============================================================================
+#
+# DAG design
+# ----------
+#
+#   1. gap_analysis  (1 job per sample, no SDK)
+#      Compares *_isotopes_filtered.csv against the reference CSV.
+#      Writes {sample}_unmatched.csv (signals the pipeline missed) and
+#      {sample}_gap_summary.txt (per-charge recovery rates).
+#
+#   2. split_unmatched  (checkpoint, 1 job per sample, no SDK)
+#      Splits {sample}_unmatched.csv into fixed-size batch files so the
+#      tracer can run in parallel across SLURM jobs.
+#
+#   3. trace_batch  (ceil(N_unmatched / batch_size) jobs per sample, needs SDK)
+#      Each job re-runs the pipeline stages on the slices that contain its
+#      batch of missing signals and annotates at which stage each signal
+#      was dropped (bpi_tic / ntf_no_factors / ntf_gaussian / isotope_* /
+#      post_filter / recovered).  Requires Waters SDK → runs in Singularity.
+#
+#   4. aggregate_traces  (1 job per sample, no SDK)
+#      Concatenates all batch trace CSVs into one {sample}_trace_report.csv
+#      and prints the lost_at breakdown.
+#
+#   5. complete_families  (1 job per sample, no SDK)
+#      Adds sibling charge states for proteins the pipeline detected at ≥1
+#      charge state but missed at others.  Writes *_isotopes_completed.csv.
+#      Runs independently of the tracer DAG.
+#
+# Launch on a SLURM cluster
+# -------------------------
+#   mkdir -p results/diagnostic/logs/slurm
+#
+#   snakemake -s src/Snakefile_diagnostic \
+#     --configfile src/config_diagnostic.yaml \
+#     -j 500 --keep-going \
+#     --use-singularity \
+#     --singularity-args "--bind /projects/b1107,/scratch/ajf4103" \
+#     --cluster "sbatch -A p31346 -p short -N 1 -n {resources.cpus} \
+#                --mem={resources.mem_mb}M -t {resources.runtime} \
+#                --output results/diagnostic/logs/slurm-%j.out \
+#                --error  results/diagnostic/logs/slurm-%j.err" \
+#     --max-jobs-per-second 3 \
+#     --latency-wait 60 \
+#     --rerun-incomplete
+# =============================================================================
+
+import math
+import os
+
+configfile: "src/config_diagnostic.yaml"
+
+singularity: os.path.expanduser(config["singularity_image"])
+
+PYTHON    = config.get("python_exec", "python3")
+LICENSE   = config["license_path"]
+MAIN_CFG  = config["main_config"]
+DIAG_DIR  = config["diagnostic_dir"]
+
+SAMPLES  = config["samples"]          # {stem: raw_path}
+REF_CSVS = config["reference_csvs"]  # {stem: ref_csv_path}
+
+ISOTOPES_FILTERED = config["isotopes_filtered_pattern"]
+ISOTOPES_CAL      = config["isotopes_cal_pattern"]
+
+GAP    = config["gap"]
+TRACER = config["tracer"]
+FAMILY = config["family"]
+
+DIAGNOSTIC_PY = os.path.join(workflow.basedir, "diagnostic_gap_analysis.py")
+TROUBLESHOOT  = os.path.join(workflow.basedir, "troubleshoot.py")
+PIPELINE      = os.path.join(workflow.basedir, "pipeline.py")
+
+
+# ---------------------------------------------------------------------------
+# Wildcard constraints
+# ---------------------------------------------------------------------------
+
+wildcard_constraints:
+    sample   = r"[^/]+",
+    batch_id = r"\d{4}",
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helper — resolve batch IDs after split_unmatched has run
+# ---------------------------------------------------------------------------
+
+def _trace_batch_inputs(wildcards):
+    split_dir = checkpoints.split_unmatched.get(sample=wildcards.sample).output.batch_dir
+    ids = sorted(
+        glob_wildcards(os.path.join(split_dir, "batch_{batch_id}.csv")).batch_id
+    )
+    return expand(
+        os.path.join(DIAG_DIR, "{sample}", "trace_results", "batch_{batch_id}.csv"),
+        sample=wildcards.sample,
+        batch_id=ids,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Top-level targets
+# ---------------------------------------------------------------------------
+
+rule all:
+    input:
+        expand(os.path.join(DIAG_DIR, "{sample}_gap_summary.txt"),  sample=SAMPLES),
+        expand(os.path.join(DIAG_DIR, "{sample}_trace_report.csv"), sample=SAMPLES),
+        expand("results/final/{sample}_isotopes_completed.csv",      sample=SAMPLES),
+
+
+# ---------------------------------------------------------------------------
+# Rule 1: gap_analysis — compare pipeline output vs reference (1 job)
+# ---------------------------------------------------------------------------
+
+rule gap_analysis:
+    input:
+        ref_csv  = lambda wc: REF_CSVS[wc.sample],
+        pipe_csv = lambda wc: ISOTOPES_FILTERED.format(sample=wc.sample),
+    output:
+        unmatched = os.path.join(DIAG_DIR, "{sample}_unmatched.csv"),
+        summary   = os.path.join(DIAG_DIR, "{sample}_gap_summary.txt"),
+    params:
+        python = PYTHON,
+        script = DIAGNOSTIC_PY,
+        mz_ppm = GAP["mz_ppm"],
+        rt_tol = GAP["rt_tol"],
+    resources:
+        mem_mb  = config["resources"]["gap_analysis"]["mem_mb"],
+        runtime = config["resources"]["gap_analysis"]["runtime"],
+        cpus    = config["resources"]["gap_analysis"]["cpus"],
+    log:
+        os.path.join(DIAG_DIR, "logs", "{sample}_gap_analysis.log"),
+    shell:
+        """
+        {params.python} {params.script} \
+            {input.ref_csv} \
+            {input.pipe_csv} \
+            --mz_ppm     {params.mz_ppm} \
+            --rt_tol     {params.rt_tol} \
+            --output_csv {output.unmatched} \
+        > {output.summary} 2> {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 2: split_unmatched — split CSV into per-job batches
+# ---------------------------------------------------------------------------
+# Runs in the Snakemake process (no container needed).  Creates one
+# batch_{NNNN}.csv per (batch_size) rows inside trace_batches/.
+
+checkpoint split_unmatched:
+    input:
+        unmatched = os.path.join(DIAG_DIR, "{sample}_unmatched.csv"),
+    output:
+        batch_dir = directory(os.path.join(DIAG_DIR, "{sample}", "trace_batches")),
+    params:
+        batch_size = TRACER["batch_size"],
+    run:
+        import pandas as pd
+        os.makedirs(output.batch_dir, exist_ok=True)
+        df = pd.read_csv(input.unmatched)
+        n  = int(params.batch_size)
+        for i in range(math.ceil(max(len(df), 1) / n)):
+            df.iloc[i * n : (i + 1) * n].to_csv(
+                os.path.join(output.batch_dir, f"batch_{i:04d}.csv"),
+                index=False,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Rule 3: trace_batch — signal tracer on one batch (parallel SLURM jobs)
+# ---------------------------------------------------------------------------
+# Requires the Waters SDK → must run inside Singularity.
+# Each job processes `batch_size` signals sequentially.
+
+rule trace_batch:
+    input:
+        raw       = lambda wc: SAMPLES[wc.sample],
+        batch_csv = os.path.join(DIAG_DIR, "{sample}", "trace_batches", "batch_{batch_id}.csv"),
+    output:
+        result = os.path.join(DIAG_DIR, "{sample}", "trace_results", "batch_{batch_id}.csv"),
+    params:
+        python  = PYTHON,
+        script  = TROUBLESHOOT,
+        license = LICENSE,
+        cfg     = MAIN_CFG,
+    resources:
+        mem_mb  = config["resources"]["trace_batch"]["mem_mb"],
+        runtime = config["resources"]["trace_batch"]["runtime"],
+        cpus    = config["resources"]["trace_batch"]["cpus"],
+    log:
+        os.path.join(DIAG_DIR, "logs", "{sample}_trace_{batch_id}.log"),
+    shell:
+        """
+        {params.python} {params.script} trace_missing \
+            {input.raw} \
+            {params.license} \
+            {input.batch_csv} \
+            --config {params.cfg} \
+            --output {output.result} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Rule 4: aggregate_traces — concatenate all batch trace outputs (1 job)
+# ---------------------------------------------------------------------------
+# Runs in the Snakemake process.  Prints lost_at breakdown to stdout.
+
+rule aggregate_traces:
+    input:
+        _trace_batch_inputs,
+    output:
+        report = os.path.join(DIAG_DIR, "{sample}_trace_report.csv"),
+    run:
+        import pandas as pd
+        dfs = [pd.read_csv(f) for f in input if os.path.getsize(f) > 0]
+        combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        combined.to_csv(output.report, index=False)
+        print(f"\n[aggregate_traces] {len(combined)} signals → {output.report}")
+        if "lost_at" in combined.columns:
+            print(combined["lost_at"].value_counts().to_string())
+
+
+# ---------------------------------------------------------------------------
+# Rule 5: complete_families — add sibling charge states (1 job per sample)
+# ---------------------------------------------------------------------------
+# Uses the calibrated (but not quality-filtered) aggregate as the source for
+# sibling candidates.  Runs independently of the tracer DAG.
+
+rule complete_families:
+    input:
+        filtered   = lambda wc: ISOTOPES_FILTERED.format(sample=wc.sample),
+        unfiltered = lambda wc: ISOTOPES_CAL.format(sample=wc.sample),
+    output:
+        csv = "results/final/{sample}_isotopes_completed.csv",
+    params:
+        python   = PYTHON,
+        pipeline = PIPELINE,
+        mw_ppm   = FAMILY["mw_ppm"],
+        rt_tol   = FAMILY["rt_tol"],
+    resources:
+        mem_mb  = config["resources"]["complete_families"]["mem_mb"],
+        runtime = config["resources"]["complete_families"]["runtime"],
+        cpus    = config["resources"]["complete_families"]["cpus"],
+    log:
+        os.path.join(DIAG_DIR, "logs", "{sample}_complete_families.log"),
+    shell:
+        """
+        {params.python} {params.pipeline} complete_families \
+            --filtered_csv   {input.filtered} \
+            --unfiltered_csv {input.unfiltered} \
+            --output_csv     {output.csv} \
+            --mw_ppm         {params.mw_ppm} \
+            --rt_tol         {params.rt_tol} \
+        > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks
+# ---------------------------------------------------------------------------
+
+onsuccess:
+    slurm_logs = os.path.join(DIAG_DIR, "logs", "slurm")
+    if os.path.isdir(slurm_logs):
+        import shutil
+        shutil.rmtree(slurm_logs)
+        print(f"[onsuccess] Deleted SLURM log directory: {slurm_logs}")

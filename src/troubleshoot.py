@@ -1173,14 +1173,18 @@ def batch_trace_missing(
     license_path: str,
     unmatched_csv: str,
     config: Dict,
-    n_signals: int = 50,
+    n_signals: int = -1,
     output_csv: str = "trace_report.csv",
     function: int = 0,
 ) -> None:
-    """Run trace_missing_signal on the first n_signals rows of unmatched_csv."""
+    """Run trace_missing_signal on rows of unmatched_csv.
+
+    n_signals <= 0 means process all rows (default); positive values cap the run.
+    """
     import pandas as pd
 
-    unmatched = pd.read_csv(unmatched_csv).head(n_signals)
+    df = pd.read_csv(unmatched_csv)
+    unmatched = df if n_signals <= 0 else df.head(n_signals)
     print(f"Tracing {len(unmatched)} missing signals from {unmatched_csv}")
 
     records = []
@@ -1235,8 +1239,8 @@ if __name__ == "__main__":
         tp.add_argument("unmatched_csv",  help="CSV of unmatched reference signals")
         tp.add_argument("--config",       default="src/config.yaml",
                         help="Pipeline config YAML")
-        tp.add_argument("--n_signals",    type=int, default=50,
-                        help="Number of signals to trace")
+        tp.add_argument("--n_signals",    type=int, default=-1,
+                        help="Number of signals to trace (-1 = all rows)")
         tp.add_argument("--output",       default="trace_report.csv",
                         help="Output CSV path")
         tp.add_argument("--function",     type=int, default=0)
