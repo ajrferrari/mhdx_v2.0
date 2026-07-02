@@ -951,49 +951,64 @@ def trace_missing_signal(
     stage the signal reached before being dropped.
 
     Returns a dict with keys:
-        lost_at       : one of 'bpi_tic' | 'ntf_no_factors' | 'ntf_gaussian' |
-                        'isotope_min_peaks' | 'isotope_cosine' | 'post_filter' |
-                        'recovered' | 'not_in_any_slice'
+        lost_at       : one of 'not_in_any_slice' | 'bpi_tic' | 'ntf_no_factors' |
+                        'ntf_gaussian' | 'isotope_min_peaks' | 'isotope_cosine' |
+                        'post_filter' | 'recovered'
         n_slices      : number of overlapping slices examined
         best_cosine   : best cosine found across all slices (None if never reached)
-        ntf_factors   : (n_factors, n_passing_gauss) tuple for the best slice
+        ntf_factors   : (final_rank, n_passing_gauss) tuple for the best slice
         slice_coords  : (rt_lo, rt_hi, dt_lo, dt_hi, mz_lo, mz_hi) of the best slice
     """
-    from pipeline import generate_slice_grid, _process_slice_inner, _compute_slice_bpi_tic
-    from tensor_analysis import analyze_chunk
-    from isotope_analysis import find_isotopic_clusters
+    from pipeline import generate_slice_grid, _compute_slice_bpi_tic
     from waters_reader import WatersRawReader, read_license
 
-    ntf_cfg   = config.get("ntf", {})
-    iso_cfg   = config.get("isotope", {})
-    filt_cfg  = config.get("filters", {})
-    tsr_cfg   = config.get("tensor", {})
+    ntf_cfg  = config.get("ntf", {})
+    iso_cfg  = config.get("isotope", {})
+    filt_cfg = config.get("filters", {})
+    tsr_cfg  = config.get("tensor", {})
+    slc_cfg  = config.get("slice", {})
 
     license_key = read_license(license_path)
 
-    # Determine overlapping slices
-    grid = generate_slice_grid(raw_path, license_path, config)
-    candidates = [
-        s for s in grid
-        if s["mz_lo"] <= obs_mz <= s["mz_hi"]
-        and s["rt_lo"] <= rt <= s["rt_hi"]
-        and s["dt_lo"] <= im_mono <= s["dt_hi"]
-    ]
-
-    if not candidates:
-        return {"lost_at": "not_in_any_slice", "n_slices": 0,
-                "best_cosine": None, "ntf_factors": None, "slice_coords": None}
-
-    # Run each slice and track the furthest stage reached
     stage_order = [
         "not_in_any_slice", "bpi_tic", "ntf_no_factors", "ntf_gaussian",
         "isotope_min_peaks", "isotope_cosine", "post_filter", "recovered",
     ]
-
-    best: Dict = {"lost_at": "bpi_tic", "n_slices": len(candidates),
+    best: Dict = {"lost_at": "not_in_any_slice", "n_slices": 0,
                   "best_cosine": None, "ntf_factors": None, "slice_coords": None}
 
     with WatersRawReader(raw_path, license=license_key) as reader:
+        # Read file axis ranges to build the slice grid (same pattern as write_slice_list)
+        meta     = reader.metadata()
+        rt_range = meta.rt_range[function]
+        mz_range = meta.mass_range[function]
+        n_drift  = meta.n_drift_bins[function]
+
+        grid = generate_slice_grid(
+            rt_min=float(rt_range[0]),  rt_max=float(rt_range[1]),
+            dt_min=0,                    dt_max=int(n_drift - 1),
+            mz_min=float(mz_range[0]),  mz_max=float(mz_range[1]),
+            dt_width=slc_cfg.get("dt_width", 50),
+            dt_step=slc_cfg.get("dt_step",   25),
+            rt_width=slc_cfg.get("rt_width",  1.0),
+            rt_step=slc_cfg.get("rt_step",    0.5),
+            mz_width=slc_cfg.get("mz_width", 100.0),
+            mz_step=slc_cfg.get("mz_step",    50.0),
+        )
+
+        candidates = [
+            s for s in grid
+            if s["mz_lo"] <= obs_mz  <= s["mz_hi"]
+            and s["rt_lo"] <= rt      <= s["rt_hi"]
+            and s["dt_lo"] <= im_mono <= s["dt_hi"]
+        ]
+
+        if not candidates:
+            return best
+
+        best["n_slices"] = len(candidates)
+        best["lost_at"]  = "bpi_tic"
+
         for s in candidates:
             result = _trace_one_slice(
                 reader, s, obs_mz, charge, rt, im_mono,
@@ -1028,6 +1043,7 @@ def _trace_one_slice(
     from tensor_analysis import analyze_chunk
     from isotope_analysis import find_isotopic_clusters
     from pipeline import _compute_slice_bpi_tic
+    import numpy as np
 
     coords = (s["rt_lo"], s["rt_hi"], s["dt_lo"], s["dt_hi"], s["mz_lo"], s["mz_hi"])
     base   = {"slice_coords": coords, "best_cosine": None, "ntf_factors": None}
@@ -1057,50 +1073,70 @@ def _trace_one_slice(
         n_restarts=ntf_cfg.get("n_restarts", 3),
         rt_r2_min=ntf_cfg.get("rt_r2_min", 0.75),
         dt_r2_min=ntf_cfg.get("dt_r2_min", 0.75),
+        apply_quality_filter=True,
+        plot=False,
         verbose=verbose,
     )
 
     A = chunk.get("A")
-    if A is None or A.shape[1] == 0:
+    final_rank = chunk.get("final_rank", 0)
+
+    if A is None or final_rank == 0:
         return {**base, "lost_at": "ntf_no_factors"}
 
-    n_total   = chunk.get("n_factors_raw", A.shape[1])
     n_passing = A.shape[1]
-    base["ntf_factors"] = (n_total, n_passing)
+    base["ntf_factors"] = (final_rank, n_passing)
 
     if n_passing == 0:
         return {**base, "lost_at": "ntf_gaussian"}
 
-    # Stage 3 — isotope detection
-    mz_axis = chunk.get("mz_axis")
-    if mz_axis is None:
+    # Stage 3 — isotope detection (one call per NTF factor, same pattern as _run_pipeline)
+    B     = chunk["B"]
+    C     = chunk["C"]
+    mz_ax = chunk.get("mz_axis_ntf", chunk.get("mz_axis"))
+    rt_ax = chunk.get("rt_axis_ntf", chunk.get("rt_axis"))
+    dt_ax = chunk.get("dt_axis_ntf", chunk.get("dt_axis"))
+
+    if mz_ax is None:
         return {**base, "lost_at": "ntf_no_factors"}
 
     charge_range = tuple(iso_cfg.get("charge_range", [2, 15]))
     min_cosine   = iso_cfg.get("min_cosine", 0.5)
     min_peaks    = iso_cfg.get("min_peaks_per_cluster", 2)
 
-    clusters_all = find_isotopic_clusters(
-        mz_axis, chunk["C"],
-        charge_range=charge_range,
-        min_cosine=min_cosine,
-        min_peaks_per_cluster=min_peaks,
-    )
+    clusters_all: list = []
+    for r in range(A.shape[1]):
+        clusters_all.extend(find_isotopic_clusters(
+            A[:, r], B[:, r], C[:, r],
+            mz_axis=mz_ax,
+            rt_axis=rt_ax,
+            dt_axis=dt_ax,
+            charge_range=charge_range,
+            min_cosine=min_cosine,
+            min_peaks_per_cluster=min_peaks,
+            factor_idx=r,
+            output_dir=None,
+            verbose=False,
+            mz_axis_full=chunk.get("mz_axis"),
+            mask_mz=chunk.get("mask_mz"),
+        ))
 
     if not clusters_all:
-        # Check if it failed at min_peaks or cosine by trying with relaxed params
-        clusters_relaxed = find_isotopic_clusters(
-            mz_axis, chunk["C"],
-            charge_range=charge_range,
-            min_cosine=0.1,
-            min_peaks_per_cluster=2,
-        )
-        if clusters_relaxed:
-            return {**base, "lost_at": "isotope_min_peaks"}
-        return {**base, "lost_at": "isotope_cosine"}
+        # Distinguish isotope_min_peaks from isotope_cosine by trying looser params
+        relaxed: list = []
+        for r in range(A.shape[1]):
+            relaxed.extend(find_isotopic_clusters(
+                A[:, r], B[:, r], C[:, r],
+                mz_axis=mz_ax, rt_axis=rt_ax, dt_axis=dt_ax,
+                charge_range=charge_range,
+                min_cosine=0.1,
+                min_peaks_per_cluster=2,
+                factor_idx=r, output_dir=None, verbose=False,
+                mz_axis_full=chunk.get("mz_axis"), mask_mz=chunk.get("mask_mz"),
+            ))
+        return {**base, "lost_at": "isotope_min_peaks" if relaxed else "isotope_cosine"}
 
     # Check if the target signal is among detected clusters
-    import numpy as np
     best_cosine = None
     for cluster in clusters_all:
         if int(cluster.get("charge", 0)) != charge:
@@ -1117,16 +1153,14 @@ def _trace_one_slice(
     if best_cosine is None:
         return {**base, "lost_at": "isotope_cosine"}
 
-    # Stage 4 — post-filter (check quality criteria)
-    # The rt/dt R² values come from the NTF factor, not the cluster directly.
-    # Check the factor R² for the factor this cluster was detected in.
-    rt_r2_min = filt_cfg.get("rt_gaussian_r2_min", 0.80)
-    dt_r2_min = filt_cfg.get("dt_gaussian_r2_min", 0.80)
-    factor_r2 = chunk.get("factor_quality", [])
-    if factor_r2:
+    # Stage 4 — post-filter: check NTF Gaussian R² for any passing factor
+    rt_r2_min    = filt_cfg.get("rt_gaussian_r2_min", 0.80)
+    dt_r2_min    = filt_cfg.get("dt_gaussian_r2_min", 0.80)
+    quality_info = chunk.get("quality_info", {})
+    if quality_info:
         any_good = any(
-            q.get("rt_r2", 0) >= rt_r2_min and q.get("dt_r2", 0) >= dt_r2_min
-            for q in factor_r2
+            q.get("rt_r2", 0.0) >= rt_r2_min and q.get("dt_r2", 0.0) >= dt_r2_min
+            for q in quality_info.values()
         )
         if not any_good:
             return {**base, "lost_at": "post_filter"}
