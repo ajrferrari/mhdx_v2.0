@@ -83,6 +83,9 @@ wildcard_constraints:
     sample   = r"[^/]+",
     batch_id = r"\d{4}",
 
+# run: blocks execute in the Snakemake process — never submit to SLURM
+localrules: split_unmatched, aggregate_traces
+
 
 # ---------------------------------------------------------------------------
 # Checkpoint helper — resolve batch IDs after split_unmatched has run
