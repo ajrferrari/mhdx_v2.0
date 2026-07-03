@@ -1046,6 +1046,7 @@ def trace_missing_signal(
         )
         if stage_order.index(result["lost_at"]) > stage_order.index(best["lost_at"]):
             best = result
+            best["n_slices"] = len(candidates)
 
     return best
 
