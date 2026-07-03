@@ -930,6 +930,31 @@ def inspect_slice(
 # trace_missing_signal: per-signal diagnostic tracer
 # ---------------------------------------------------------------------------
 
+def _best_centered_slice(
+    candidates: list,
+    obs_mz: float,
+    rt: float,
+    im_mono: float,
+) -> dict:
+    """Return the slice where the signal is most interior.
+
+    Scores each candidate by the minimum fractional distance from any of its
+    six faces.  A signal exactly at the centre scores 0.5; one touching an
+    edge scores 0.  Returns the highest-scoring candidate (first on ties).
+    """
+    best_s, best_score = candidates[0], -1.0
+    for s in candidates:
+        rt_span = s["rt_hi"] - s["rt_lo"]
+        dt_span = s["dt_hi"] - s["dt_lo"]
+        mz_span = s["mz_hi"] - s["mz_lo"]
+        rt_m = min(rt      - s["rt_lo"], s["rt_hi"] - rt)      / rt_span if rt_span > 0 else 0.0
+        dt_m = min(im_mono - s["dt_lo"], s["dt_hi"] - im_mono) / dt_span if dt_span > 0 else 0.0
+        mz_m = min(obs_mz  - s["mz_lo"], s["mz_hi"] - obs_mz) / mz_span if mz_span > 0 else 0.0
+        score = min(rt_m, dt_m, mz_m)
+        if score > best_score:
+            best_s, best_score = s, score
+    return best_s
+
 def trace_missing_signal(
     raw_path: str,
     license_path: str,
@@ -1009,15 +1034,18 @@ def trace_missing_signal(
         best["n_slices"] = len(candidates)
         best["lost_at"]  = "bpi_tic"
 
-        for s in candidates:
-            result = _trace_one_slice(
-                reader, s, obs_mz, charge, rt, im_mono,
-                function, ntf_cfg, iso_cfg, filt_cfg, tsr_cfg,
-                mz_ppm, rt_tol, dt_tol, verbose,
-            )
-            if stage_order.index(result["lost_at"]) > stage_order.index(best["lost_at"]):
-                best = result
-                best["n_slices"] = len(candidates)
+        # Use only the most interior slice — the one where the signal sits
+        # farthest from any edge.  Running all overlapping slices (up to 8
+        # due to 50% overlap in RT × DT × m/z) multiplies NTF cost by ~8×,
+        # making each batch take 12–16 h instead of the allocated 4 h.
+        s = _best_centered_slice(candidates, obs_mz, rt, im_mono)
+        result = _trace_one_slice(
+            reader, s, obs_mz, charge, rt, im_mono,
+            function, ntf_cfg, iso_cfg, filt_cfg, tsr_cfg,
+            mz_ppm, rt_tol, dt_tol, verbose,
+        )
+        if stage_order.index(result["lost_at"]) > stage_order.index(best["lost_at"]):
+            best = result
 
     return best
 

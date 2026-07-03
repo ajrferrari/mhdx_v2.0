@@ -95,7 +95,7 @@ gap:
 #              batch_size=25 → ~50 min/job, well within a 120 min runtime.
 
 tracer:
-  batch_size: 25
+  batch_size: 50
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ resources:
 
   trace_batch:
     mem_mb:  8000    # NTF needs ~4–6 GB; 8 GB gives headroom
-    runtime: 120     # 25 signals × ~2 min/signal + NTF overhead
+    runtime: 240     # 50 signals × 1 slice × ~4 min/NTF + overhead
     cpus:    1
 
   aggregate:
